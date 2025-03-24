@@ -30,3 +30,6 @@ requires-python = ">=3.7"
 
 [tool.setuptools]
 packages = ["glycorender"]
+
+[tool.setuptools.package-data]
+glycorender = ["fonts/*.ttf", "fonts/LICENSE"]

@@ -5,6 +5,9 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.colors import Color, black
 from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.units import mm
+from reportlab.pdfbase.ttfonts import TTFont
+import os
+import pkg_resources
 
 reportlab_colors = {
   'darkblue': (0, 0, 0.545),
@@ -585,7 +588,7 @@ def draw_rectangles(c, root, all_gradients, ns):
       draw_rect(c, x, y, width, height, stroke, fill, stroke_width)
 
 
-def process_text_elements(c, root, all_paths, ns):
+def process_text_elements(c, root, all_paths, ns, font_to_use):
   """Process and draw text elements including text on paths."""
   for text in root.findall('.//svg:text', ns):
     font_size = float(text.get('font-size', '12'))
@@ -625,7 +628,21 @@ def process_text_elements(c, root, all_paths, ns):
       elif start_offset.isdigit():
         offset_percent = float(start_offset) / path_length(path_points) * 100
       draw_text_on_path(c, text_content, path_points, offset_percent,
-                       'Helvetica', font_size, fill, text_anchor, offset_y=offset_y, is_bold=is_bold)
+                      font_to_use, font_size, fill, text_anchor, offset_y=offset_y, is_bold=is_bold)
+
+
+def register_bundled_fonts():
+    """Register bundled Comfortaa font."""
+    # Get paths to bundled font files
+    font_name = 'Comfortaa'
+    font_regular = pkg_resources.resource_filename('glycorender', 'fonts/Comfortaa-Regular.ttf')
+    font_bold = pkg_resources.resource_filename('glycorender', 'fonts/Comfortaa-Bold.ttf')
+    # Register fonts with ReportLab
+    pdfmetrics.registerFont(TTFont(font_name, font_regular))
+    pdfmetrics.registerFont(TTFont(f'{font_name}-Bold', font_bold))
+    # Create font family mapping
+    pdfmetrics.registerFontFamily(font_name, normal=font_name, bold=f'{font_name}-Bold')
+    return font_name
 
 
 def convert_svg_to_pdf(svg_data, pdf_file_path):
@@ -637,7 +654,9 @@ def convert_svg_to_pdf(svg_data, pdf_file_path):
   # Parse dimensions and set up canvas
   width, height, vb_x, vb_y, scale_x, scale_y = parse_svg_dimensions(root)
   c = canvas.Canvas(pdf_file_path, pagesize=(width, height))
-  pdfmetrics.registerFont(pdfmetrics.Font('Helvetica-Bold', 'Helvetica-Bold', 'WinAnsiEncoding'))
+  #pdfmetrics.registerFont(pdfmetrics.Font('Helvetica-Bold', 'Helvetica-Bold', 'WinAnsiEncoding'))
+  # Register bundled font
+  font_to_use = register_bundled_fonts()
   # Extract definitions and find connection paths
   all_paths, all_gradients = extract_defs(root, ns)
   connection_path_ids = find_connection_paths(root, all_paths, ns)
@@ -652,5 +671,5 @@ def convert_svg_to_pdf(svg_data, pdf_file_path):
   draw_circle_shapes(c, root, all_gradients, ns)
   draw_rectangles(c, root, all_gradients, ns)
   draw_paths(c, root, connection_path_ids, all_gradients, ns)
-  process_text_elements(c, root, all_paths, ns)
+  process_text_elements(c, root, all_paths, ns, font_to_use)
   c.save()
