@@ -5,6 +5,7 @@ import tempfile
 import re
 import os
 import math
+from pathlib import Path
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.units import mm
@@ -12,7 +13,6 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.graphics import renderPDF
 from reportlab.graphics.shapes import Drawing
 import fitz
-from importlib import resources
 from svglib.svglib import svg2rlg
 from io import BytesIO
 
@@ -712,15 +712,13 @@ def process_text_elements(c, root, all_paths, ns, font_to_use):
 
 def register_bundled_fonts():
   """Register bundled Comfortaa font."""
-  # Get paths to bundled font files
   font_name = 'Comfortaa'
-  # Use importlib.resources.files() to get file paths
-  font_regular_path = resources.files('glycorender.fonts').joinpath('Comfortaa-Regular.ttf')
-  font_bold_path = resources.files('glycorender.fonts').joinpath('Comfortaa-Bold.ttf')
-  # Register fonts with ReportLab
-  pdfmetrics.registerFont(TTFont(font_name, str(font_regular_path)))
-  pdfmetrics.registerFont(TTFont(f'{font_name}-Bold', str(font_bold_path)))
-  # Create font family mapping
+  # Get the location of this module file and navigate to fonts directory
+  this_dir = Path(__file__).parent / 'fonts' 
+  font_regular = this_dir / 'Comfortaa-Regular.ttf'
+  font_bold = this_dir / 'Comfortaa-Bold.ttf'
+  pdfmetrics.registerFont(TTFont(font_name, str(font_regular)))
+  pdfmetrics.registerFont(TTFont(f'{font_name}-Bold', str(font_bold)))
   pdfmetrics.registerFontFamily(font_name, normal=font_name, bold=f'{font_name}-Bold')
   return font_name
 
