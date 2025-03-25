@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="importlib._bootstrap")
 import xml.etree.ElementTree as ET
 import tempfile
 import re
@@ -7,8 +9,12 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.units import mm
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.graphics import renderPDF
+from reportlab.graphics.shapes import Drawing
 import fitz
-import pkg_resources
+from importlib import resources
+from svglib.svglib import svg2rlg
+from io import BytesIO
 
 reportlab_colors = {
   'darkblue': (0, 0, 0.545),
@@ -425,8 +431,17 @@ def draw_radial_gradient_shape(c, cx, cy, r, stops, shape_func):
 
 def parse_svg_dimensions(root):
   """Parse SVG dimensions and viewbox."""
-  width = float(root.get('width', '100'))
-  height = float(root.get('height', '100'))
+  width_raw = root.get('width', 100)
+  height_raw = root.get('height', 100)
+  # Convert to float, handling both numeric values and strings with units
+  if isinstance(width_raw, (int, float)):
+    width = float(width_raw)
+  else:
+    width = float(re.sub(r'[^\d.]', '', width_raw))
+  if isinstance(height_raw, (int, float)):
+    height = float(height_raw)
+  else:
+    height = float(re.sub(r'[^\d.]', '', height_raw))
   viewbox = root.get('viewBox', f'0 0 {width} {height}')
   vbox_parts = [float(x) for x in viewbox.split() if x.strip()]
   if len(vbox_parts) == 4:
@@ -696,30 +711,92 @@ def process_text_elements(c, root, all_paths, ns, font_to_use):
 
 
 def register_bundled_fonts():
-    """Register bundled Comfortaa font."""
-    # Get paths to bundled font files
-    font_name = 'Comfortaa'
-    font_regular = pkg_resources.resource_filename('glycorender', 'fonts/Comfortaa-Regular.ttf')
-    font_bold = pkg_resources.resource_filename('glycorender', 'fonts/Comfortaa-Bold.ttf')
-    # Register fonts with ReportLab
-    pdfmetrics.registerFont(TTFont(font_name, font_regular))
-    pdfmetrics.registerFont(TTFont(f'{font_name}-Bold', font_bold))
-    # Create font family mapping
-    pdfmetrics.registerFontFamily(font_name, normal=font_name, bold=f'{font_name}-Bold')
-    return font_name
+  """Register bundled Comfortaa font."""
+  # Get paths to bundled font files
+  font_name = 'Comfortaa'
+  # Use importlib.resources.files() to get file paths
+  font_regular_path = resources.files('glycorender.fonts').joinpath('Comfortaa-Regular.ttf')
+  font_bold_path = resources.files('glycorender.fonts').joinpath('Comfortaa-Bold.ttf')
+  # Register fonts with ReportLab
+  pdfmetrics.registerFont(TTFont(font_name, str(font_regular_path)))
+  pdfmetrics.registerFont(TTFont(f'{font_name}-Bold', str(font_bold_path)))
+  # Create font family mapping
+  pdfmetrics.registerFontFamily(font_name, normal=font_name, bold=f'{font_name}-Bold')
+  return font_name
 
 
-def convert_svg_to_pdf(svg_data, pdf_file_path, return_canvas=False):
+# Register bundled font
+font_to_use = register_bundled_fonts()
+
+
+def convert_chem_to_file(svg_data, file_path=None, return_bytes=False):
+  """
+  Convert a chemical 2D depiction from RDKit into a .pdf/.png
+  If return_bytes is True, returns the file contents as bytes instead of saving to disk.
+  """
+  width_match = re.search(r'width=[\'"](\d+)px[\'"]', svg_data)
+  height_match = re.search(r'height=[\'"](\d+)px[\'"]', svg_data)
+  width = int(width_match.group(1)) if width_match else 250
+  height = int(height_match.group(1)) if height_match else 250
+  svg_bytes = svg_data.encode('utf-8')
+  drawing = svg2rlg(BytesIO(svg_bytes))
+  drawing.width, drawing.height = width, height
+  # Determine output format based on file extension or default
+  ext = 'png' if file_path is None else file_path.lower().split('.')[-1]
+  # For PNG output
+  if ext == 'png':
+    # Create a temporary PDF
+    temp_pdf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+    temp_pdf_path = temp_pdf.name
+    temp_pdf.close()
+    # Create PDF
+    renderPDF.drawToFile(drawing, temp_pdf_path)
+    # Convert PDF to PNG using fitz
+    doc = fitz.open(temp_pdf_path)
+    page = doc.load_page(0)
+    pix = page.get_pixmap(dpi=300)  # Adjust DPI for quality
+    if return_bytes:
+      png_bytes = pix.tobytes("png")
+      doc.close()
+      os.unlink(temp_pdf_path)
+      return png_bytes
+    else:
+      pix.save(file_path)
+      doc.close()
+      os.unlink(temp_pdf_path)
+      return None
+  # For PDF output
+  else:
+    if return_bytes:
+      # Create a temporary file for PDF
+      temp_pdf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+      temp_pdf_path = temp_pdf.name
+      temp_pdf.close()
+      # Generate the PDF
+      renderPDF.drawToFile(drawing, temp_pdf_path)
+      # Read the file contents
+      with open(temp_pdf_path, 'rb') as f:
+        pdf_bytes = f.read()
+      # Clean up
+      os.unlink(temp_pdf_path)
+      return pdf_bytes
+    else:
+      renderPDF.drawToFile(drawing, file_path)
+      return None
+
+
+def convert_svg_to_pdf(svg_data, pdf_file_path, return_canvas=False, chem=False):
   """Convert SVG to PDF with text path support."""
   if isinstance(svg_data, bytes):
     svg_data = svg_data.decode('utf-8')
+  if chem:
+    convert_chem_to_file(svg_data, pdf_file_path)
+    return None
   root = ET.fromstring(svg_data)
   ns = {'svg': 'http://www.w3.org/2000/svg', 'xlink': 'http://www.w3.org/1999/xlink'}
   # Parse dimensions and set up canvas
   width, height, vb_x, vb_y, scale_x, scale_y = parse_svg_dimensions(root)
   c = canvas.Canvas(pdf_file_path, pagesize=(width, height))
-  # Register bundled font
-  font_to_use = register_bundled_fonts()
   # Extract definitions and find connection paths
   all_paths, all_gradients = extract_defs(root, ns)
   connection_path_ids = find_connection_paths(root, all_paths, ns)
@@ -748,8 +825,14 @@ def convert_svg_to_pdf(svg_data, pdf_file_path, return_canvas=False):
   c.save()
 
 
-def convert_svg_to_png(svg_data, png_file_path=None, output_width=None, output_height=None, scale=None, return_bytes=False):
+def convert_svg_to_png(svg_data, png_file_path=None, output_width=None, output_height=None, scale=None, return_bytes=False,
+                       chem=False):
   """Convert SVG to PNG with pymupdf, with support for scaling and dimensions."""
+  if chem:
+    if return_bytes:
+      return convert_chem_to_file(svg_data, png_file_path, return_bytes=True)
+    convert_chem_to_file(svg_data, png_file_path)
+    return None
   temp_pdf = None
   if png_file_path is None:
     with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:

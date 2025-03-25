@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "glycorender"
-version = "0.1.0"
+version = "0.1.1"
 description = "A bespoke SVG to PDF/PNG renderer for the GlycoDraw platform"
 readme = "README.md"
 authors = [
@@ -21,7 +21,8 @@ classifiers = [
 keywords = ["svg", "pdf", "renderer", "glycans", "chemistry", "glycodraw"]
 dependencies = [
     "reportlab>=3.6.0",
-    "pymupdf>=1.19.0"
+    "pymupdf>=1.19.0",
+    "svglib>=1.4.0"
 ]
 requires-python = ">=3.9"
 
