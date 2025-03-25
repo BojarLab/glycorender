@@ -1,13 +1,11 @@
 import xml.etree.ElementTree as ET
-import re
+import os
 import math
 from reportlab.pdfgen import canvas
-from reportlab.lib.colors import Color
 from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.units import mm
 from reportlab.pdfbase.ttfonts import TTFont
-from PIL import Image, ImageDraw, ImageFont
-import os
+import fitz
 import pkg_resources
 
 reportlab_colors = {
@@ -269,6 +267,7 @@ def draw_text_on_path(c, text, path_points, offset_percent, font_name, font_size
   """Draw text along path."""
   if not path_points or not text:
     return
+  text = text.replace(' ', '')
   total_length = path_length(path_points)
   target_length = total_length * (offset_percent / 100.0)
   x, y, angle = point_at_length(path_points, target_length)
@@ -312,7 +311,7 @@ def draw_text_on_path(c, text, path_points, offset_percent, font_name, font_size
     actual_font = font_name + '-Bold' if is_bold else font_name
     c.setFont(actual_font, font_size)
     c.scale(1, -1)
-    c.drawString(0, 0, text)
+    c.drawString(0, 0, text, charSpace=1.0)
   c.restoreState()
 
 
@@ -682,7 +681,7 @@ def register_bundled_fonts():
     return font_name
 
 
-def convert_svg_to_pdf(svg_data, pdf_file_path):
+def convert_svg_to_pdf(svg_data, pdf_file_path, return_canvas=False):
   """Convert SVG to PDF with text path support."""
   if isinstance(svg_data, bytes):
     svg_data = svg_data.decode('utf-8')
@@ -708,189 +707,19 @@ def convert_svg_to_pdf(svg_data, pdf_file_path):
   draw_rectangles(c, root, all_gradients, ns)
   draw_paths(c, root, connection_path_ids, all_gradients, ns)
   process_text_elements(c, root, all_paths, ns, font_to_use)
+  if return_canvas:
+    return c
   c.save()
 
 
 def convert_svg_to_png(svg_data, png_file_path):
-  """Convert SVG to PNG using PIL."""
-  if isinstance(svg_data, bytes): svg_data = svg_data.decode('utf-8')
-  root = ET.fromstring(svg_data)
-  ns = {'svg': 'http://www.w3.org/2000/svg', 'xlink': 'http://www.w3.org/1999/xlink'}
-  width, height, vb_x, vb_y, scale_x, scale_y = parse_svg_dimensions(root)
-  img = Image.new('RGBA', (int(width), int(height)), color=(255, 255, 255, 255))
-  draw = ImageDraw.Draw(img)
-  font_reg = pkg_resources.resource_filename('glycorender', 'fonts/Comfortaa-Regular.ttf')
-  font_bold = pkg_resources.resource_filename('glycorender', 'fonts/Comfortaa-Bold.ttf')
-  all_paths, all_gradients = extract_defs(root, ns)
-  connection_path_ids = find_connection_paths(root, all_paths, ns)
-  # Draw elements in correct order
-  # 1. Circles with gradients
-  for circle in root.findall('.//svg:circle', ns):
-    cx, cy, r = float(circle.get('cx', '0')), float(circle.get('cy', '0')), float(circle.get('r', '0'))
-    fill = parse_color(circle.get('fill', 'none'))
-    if isinstance(fill, str) and fill in all_gradients and all_gradients[fill]['stops']:
-      c = all_gradients[fill]['stops'][0][1]
-      if c and len(c) >= 3: 
-        color = (int(c[0]*255), int(c[1]*255), int(c[2]*255))
-        tcx, tcy = (cx-vb_x)*scale_x, (cy-vb_y)*scale_y
-        tr = r * min(scale_x, scale_y)
-        draw.ellipse([tcx-tr, tcy-tr, tcx+tr, tcy+tr], fill=color)
-  # 2. Connection paths
-  for path_id in connection_path_ids:
-    path_info = all_paths[path_id]
-    points = [((x-vb_x)*scale_x, (y-vb_y)*scale_y) for x, y in path_info['points']]
-    stroke = path_info['stroke']
-    if points and len(points) > 1 and stroke and len(stroke) >= 3:
-      stroke_color = (int(stroke[0]*255), int(stroke[1]*255), int(stroke[2]*255))
-      draw.line(points, fill=stroke_color, width=int(path_info['stroke_width']))
-  # 3. Circles
-  for circle in root.findall('.//svg:circle', ns):
-    cx, cy, r = float(circle.get('cx', '0')), float(circle.get('cy', '0')), float(circle.get('r', '0'))
-    stroke, fill = parse_color(circle.get('stroke', 'none')), parse_color(circle.get('fill', 'none'))
-    stroke_width = float(circle.get('stroke-width', '1'))
-    tcx, tcy = (cx-vb_x)*scale_x, (cy-vb_y)*scale_y
-    tr = r * min(scale_x, scale_y)
-    fill_color = stroke_color = None
-    if fill and isinstance(fill, tuple) and len(fill) >= 3: fill_color = (int(fill[0]*255), int(fill[1]*255), int(fill[2]*255))
-    if stroke and isinstance(stroke, tuple) and len(stroke) >= 3: stroke_color = (int(stroke[0]*255), int(stroke[1]*255), int(stroke[2]*255))
-    if fill_color and stroke_color: draw.ellipse([tcx-tr, tcy-tr, tcx+tr, tcy+tr], fill=fill_color, outline=stroke_color, width=int(stroke_width))
-    elif fill_color: draw.ellipse([tcx-tr, tcy-tr, tcx+tr, tcy+tr], fill=fill_color)
-    elif stroke_color: draw.ellipse([tcx-tr, tcy-tr, tcx+tr, tcy+tr], outline=stroke_color, width=int(stroke_width))
-  # 4. Rectangles
-  for rect in root.findall('.//svg:rect', ns):
-    x, y = float(rect.get('x', '0')), float(rect.get('y', '0'))
-    w, h = float(rect.get('width', '0')), float(rect.get('height', '0'))
-    stroke, fill = parse_color(rect.get('stroke', 'none')), parse_color(rect.get('fill', 'none'))
-    stroke_width = float(rect.get('stroke-width', '1'))
-    tx, ty = (x-vb_x)*scale_x, (y-vb_y)*scale_y
-    tw, th = w*scale_x, h*scale_y
-    fill_color = stroke_color = None
-    if fill and isinstance(fill, tuple) and len(fill) >= 3: fill_color = (int(fill[0]*255), int(fill[1]*255), int(fill[2]*255))
-    if stroke and isinstance(stroke, tuple) and len(stroke) >= 3: stroke_color = (int(stroke[0]*255), int(stroke[1]*255), int(stroke[2]*255))
-    if fill_color and stroke_color: draw.rectangle([tx, ty, tx+tw, ty+th], fill=fill_color, outline=stroke_color, width=int(stroke_width))
-    elif fill_color: draw.rectangle([tx, ty, tx+tw, ty+th], fill=fill_color)
-    elif stroke_color: draw.rectangle([tx, ty, tx+tw, ty+th], outline=stroke_color, width=int(stroke_width))
-  # 5. Paths
-  for path in root.findall('.//svg:path', ns):
-    parent = path.find('..')
-    if (parent is not None and parent.tag.endswith('defs')) or path.get('id', '') in connection_path_ids or path.get('stroke-width') == '4.0': continue
-    path_data = path.get('d', '')
-    stroke, fill = parse_color(path.get('stroke', 'none')), parse_color(path.get('fill', 'none'))
-    stroke_width = float(path.get('stroke-width', '1'))
-    commands = parse_path(path_data)
-    points = []
-    cx, cy, sx, sy = 0, 0, None, None
-    for cmd, params in commands:
-      if cmd == 'M':
-        for i in range(0, len(params), 2):
-          cx, cy = params[i], params[i+1]
-          points.append(((cx-vb_x)*scale_x, (cy-vb_y)*scale_y))
-          if sx is None: sx, sy = points[-1]
-      elif cmd == 'm':
-        for i in range(0, len(params), 2):
-          cx, cy = cx+params[i], cy+params[i+1]
-          points.append(((cx-vb_x)*scale_x, (cy-vb_y)*scale_y))
-          if sx is None: sx, sy = points[-1]
-      elif cmd == 'L':
-        for i in range(0, len(params), 2):
-          cx, cy = params[i], params[i+1]
-          points.append(((cx-vb_x)*scale_x, (cy-vb_y)*scale_y))
-      elif cmd == 'l':
-        for i in range(0, len(params), 2):
-          cx, cy = cx+params[i], cy+params[i+1]
-          points.append(((cx-vb_x)*scale_x, (cy-vb_y)*scale_y))
-      elif cmd == 'H':
-        for param in params:
-          cx = param
-          points.append(((cx-vb_x)*scale_x, (cy-vb_y)*scale_y))
-      elif cmd == 'h':
-        for param in params:
-          cx += param
-          points.append(((cx-vb_x)*scale_x, (cy-vb_y)*scale_y))
-      elif cmd == 'V':
-        for param in params:
-          cy = param
-          points.append(((cx-vb_x)*scale_x, (cy-vb_y)*scale_y))
-      elif cmd == 'v':
-        for param in params:
-          cy += param
-          points.append(((cx-vb_x)*scale_x, (cy-vb_y)*scale_y))
-      elif (cmd == 'Z' or cmd == 'z') and sx is not None:
-        points.append((sx, sy))
-    fill_color = stroke_color = None
-    if fill and isinstance(fill, tuple) and len(fill) >= 3: fill_color = (int(fill[0]*255), int(fill[1]*255), int(fill[2]*255))
-    if stroke and isinstance(stroke, tuple) and len(stroke) >= 3: stroke_color = (int(stroke[0]*255), int(stroke[1]*255), int(stroke[2]*255))
-    if len(points) > 2 and fill_color: draw.polygon(points, fill=fill_color, outline=stroke_color)
-    elif len(points) > 1 and stroke_color: draw.line(points, fill=stroke_color, width=int(stroke_width))
-  # 6. Text elements - crucial for glycan notation
-  for text in root.findall('.//svg:text', ns):
-    font_size = float(text.get('font-size', '12'))
-    fill = parse_color(text.get('fill', '#000000'))
-    text_anchor = text.get('text-anchor', 'start')
-    fill_color = None
-    if fill and isinstance(fill, tuple) and len(fill) >= 3: fill_color = (int(fill[0]*255), int(fill[1]*255), int(fill[2]*255))
-    if not fill_color: continue
-    # Direct text
-    x, y = text.get('x'), text.get('y')
-    if x is not None and y is not None and text.text:
-      tx, ty = (float(x)-vb_x)*scale_x, (float(y)-vb_y)*scale_y
-      text_content = text.text.strip()
-      if text_content:
-        try: font = ImageFont.truetype(font_reg, int(font_size))
-        except: font = ImageFont.load_default()
-        if text_anchor == 'middle': tx -= font.getlength(text_content) / 2
-        elif text_anchor == 'end': tx -= font.getlength(text_content)
-        draw.text((tx, ty), text_content, fill=fill_color, font=font)
-      continue
-    # Text on paths - critical for glycan linkage labels
-    for textpath in text.findall('.//svg:textPath', ns):
-      href = textpath.get('{http://www.w3.org/1999/xlink}href') or textpath.get('href')
-      if not href or not href.startswith('#'): continue
-      path_id = href[1:]
-      if path_id not in all_paths: continue
-      # Collect text content and styling info
-      text_content = textpath.text or ""
-      offset_y = 0
-      is_bold = False
-      for tspan in textpath.findall('.//svg:tspan', ns):
-        if tspan.text:
-          text_content += tspan.text
-          dy = tspan.get('dy', '')
-          if dy and 'em' in dy:
-            try:
-              em_value = float(dy.replace('em', ''))
-              offset_y = em_value * font_size
-              if abs(em_value + 3.15) < 0.01:
-                  is_bold = True
-                  offset_y += 37
-            except: pass
-      if not text_content: continue
-      # Get path points and transform them
-      path_points = [(((x-vb_x)*scale_x), ((y-vb_y)*scale_y)) for x, y in all_paths[path_id]['points']]
-      if not path_points or len(path_points) < 2: continue
-      # Calculate position along path
-      start_offset = textpath.get('startOffset', '50%')
-      offset_percent = 50
-      if start_offset.endswith('%'):
-        try: offset_percent = float(start_offset[:-1])
-        except: pass
-      elif start_offset.isdigit():
-        try:
-          path_len = path_length(path_points)
-          if path_len > 0: offset_percent = float(start_offset) / path_len * 100
-        except: pass
-      # Get position and angle on path
-      total_length = path_length(path_points)
-      target_length = total_length * (offset_percent / 100.0)
-      x, y, angle = point_at_length(path_points, target_length)
-      # Apply offset - CRITICAL for correct positioning
-      try: font = ImageFont.truetype(font_bold if is_bold else font_reg, int(font_size))
-      except: font = ImageFont.load_default()
-      if offset_y: y += 5*offset_y  # Apply vertical offset
-      # Handle text anchoring
-      if text_anchor == 'middle': x -= font.getlength(text_content) / 2
-      elif text_anchor == 'end': x -= font.getlength(text_content)
-      # Draw the text
-      draw.text((x, y), text_content, fill=fill_color, font=font)
-  img.save(png_file_path, format='PNG')
-  return img
+  """Convert SVG to PNG with pymupdf."""
+  pdf_path = f"{png_file_path.split('.')[0]}.pdf"
+  canvas_object = convert_svg_to_pdf(svg_data, pdf_path, return_canvas=True)
+  canvas_object.save()
+  doc = fitz.open(canvas_object._filename)
+  page = doc[0]
+  pix = page.get_pixmap()
+  pix.save(png_file_path)
+  doc.close()
+  os.remove(pdf_path)
