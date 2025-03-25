@@ -1,4 +1,6 @@
 import xml.etree.ElementTree as ET
+import tempfile
+import re
 import os
 import math
 from reportlab.pdfgen import canvas
@@ -152,6 +154,28 @@ def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1):
           points.append((curr_x, curr_y))
       if len(points) == 4:
         is_diamond = True
+  # Check if this is a bracket part
+  is_bracket = False
+  if len(commands) == 2:
+    cmd1, params1 = commands[0]
+    cmd2, params2 = commands[1]
+    if cmd1 == 'M' and cmd2 in ['L', 'V', 'H']:
+      # Vertical line in bracket
+      if cmd2 == 'V' or (cmd2 == 'L' and len(params2) >= 2 and abs(params1[0] - params2[0]) < 0.1):
+        is_bracket = True
+      # Horizontal line in bracket
+      elif cmd2 == 'H' or (cmd2 == 'L' and len(params2) >= 2 and abs(params1[1] - params2[1]) < 0.1 and abs(params1[0] - params2[0]) < 15):
+        is_bracket = True
+  if is_bracket:
+    # For bracket components
+    c.setLineJoin(0)  # Mitered joins
+    c.setLineCap(0)   # Butt caps
+  else:
+    # For diamonds, connections, and other shapes
+    c.setLineJoin(1)  # Round joins
+    # For connection paths with stroke_width=4.0, use round caps
+    if stroke_width == 4.0 and not fill_color:
+      c.setLineCap(1)  # Round caps
   if is_diamond:
     path = c.beginPath()
     for i, (x, y) in enumerate(points):
@@ -503,6 +527,7 @@ def find_connection_paths(root, all_paths, ns):
       if path_info['stroke'] and not path_info['fill']:
         connection_path_ids.add(path_id)
   for path_id, path_info in all_paths.items():
+    # Identify connection paths (horizontal lines)
     if path_info['stroke_width'] == 4.0:
       connection_path_ids.add(path_id)
   return connection_path_ids
@@ -523,9 +548,12 @@ def draw_circles_with_gradients(c, root, all_gradients, ns):
 
 def draw_connection_paths(c, connection_path_ids, all_paths):
   """Draw connection paths between elements."""
+  c.setLineCap(1)  # Set round cap for all connection lines
   for path_id in connection_path_ids:
     path_info = all_paths[path_id]
-    draw_path(c, path_info['commands'], path_info['stroke'], None, path_info['stroke_width'])
+    # Slightly extend connection paths to ensure overlap
+    commands = path_info['commands']
+    draw_path(c, commands, path_info['stroke'], None, path_info['stroke_width'])
 
 
 def draw_circle_shapes(c, root, all_gradients, ns):
@@ -700,6 +728,14 @@ def convert_svg_to_pdf(svg_data, pdf_file_path, return_canvas=False):
   c.scale(1, -1)
   c.translate(-vb_x * scale_x, -vb_y * scale_y)
   c.scale(scale_x, scale_y)
+  g_transform = root.find('.//{http://www.w3.org/2000/svg}g').get('transform', '')
+  if g_transform.startswith('rotate(90'):
+    pivot_match = re.search(r'rotate\(90\s+([-\d.]+)\s+([-\d.]+)', g_transform)
+    if pivot_match:
+      pivot_x, pivot_y = float(pivot_match.group(1)), float(pivot_match.group(2))
+      c.translate(pivot_x, pivot_y)
+      c.rotate(90)
+      c.translate(-pivot_x, -pivot_y)
   # Draw elements in the correct order
   draw_circles_with_gradients(c, root, all_gradients, ns)
   draw_connection_paths(c, connection_path_ids, all_paths)
@@ -712,14 +748,37 @@ def convert_svg_to_pdf(svg_data, pdf_file_path, return_canvas=False):
   c.save()
 
 
-def convert_svg_to_png(svg_data, png_file_path):
-  """Convert SVG to PNG with pymupdf."""
-  pdf_path = f"{png_file_path.split('.')[0]}.pdf"
+def convert_svg_to_png(svg_data, png_file_path=None, output_width=None, output_height=None, scale=None, return_bytes=False):
+  """Convert SVG to PNG with pymupdf, with support for scaling and dimensions."""
+  temp_pdf = None
+  if png_file_path is None:
+    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+      temp_pdf = tmp.name
+      pdf_path = temp_pdf
+  else:
+    pdf_path = f"{png_file_path.split('.')[0]}.pdf"
   canvas_object = convert_svg_to_pdf(svg_data, pdf_path, return_canvas=True)
   canvas_object.save()
   doc = fitz.open(canvas_object._filename)
   page = doc[0]
-  pix = page.get_pixmap()
-  pix.save(png_file_path)
-  doc.close()
-  os.remove(pdf_path)
+  zoom_matrix = fitz.Matrix(1, 1)
+  if scale is not None:
+    zoom_matrix = fitz.Matrix(scale, scale)
+  elif output_width is not None or output_height is not None:
+    page_rect = page.rect
+    page_width, page_height = page_rect.width, page_rect.height
+    scale_x = output_width / page_width if output_width else 1
+    scale_y = output_height / page_height if output_height else 1
+    zoom_matrix = fitz.Matrix(scale_x, scale_y)
+  pix = page.get_pixmap(matrix=zoom_matrix)
+  if return_bytes:
+    png_data = pix.tobytes("png")
+    doc.close()
+    if temp_pdf:
+      os.remove(temp_pdf)
+    return png_data
+  else:
+    pix.save(png_file_path)
+    doc.close()
+    os.remove(pdf_path)
+    return None
