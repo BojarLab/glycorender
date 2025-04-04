@@ -13,7 +13,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.graphics import renderPDF
 from reportlab.graphics.shapes import Drawing
 import fitz
-from svg2rlg import svg2rlg
+from svglib.svglib import svg2rlg
 from io import BytesIO
 
 reportlab_colors = {
