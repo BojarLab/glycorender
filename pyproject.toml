@@ -22,7 +22,7 @@ keywords = ["svg", "pdf", "renderer", "glycans", "chemistry", "glycodraw"]
 dependencies = [
     "reportlab>=3.6.0",
     "pymupdf>=1.19.0",
-    "svglib>=1.4.0"
+    "svg2rlg>=0.1.0"
 ]
 requires-python = ">=3.9"
 

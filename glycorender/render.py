@@ -13,7 +13,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.graphics import renderPDF
 from reportlab.graphics.shapes import Drawing
 import fitz
-from svglib.svglib import svg2rlg
+from svg2rlg import svg2rlg
 from io import BytesIO
 
 reportlab_colors = {
@@ -711,16 +711,22 @@ def process_text_elements(c, root, all_paths, ns, font_to_use):
 
 
 def register_bundled_fonts():
-  """Register bundled Comfortaa font."""
-  font_name = 'Comfortaa'
-  # Get the location of this module file and navigate to fonts directory
-  this_dir = Path(__file__).parent / 'fonts' 
-  font_regular = this_dir / 'Comfortaa-Regular.ttf'
-  font_bold = this_dir / 'Comfortaa-Bold.ttf'
-  pdfmetrics.registerFont(TTFont(font_name, str(font_regular)))
-  pdfmetrics.registerFont(TTFont(f'{font_name}-Bold', str(font_bold)))
-  pdfmetrics.registerFontFamily(font_name, normal=font_name, bold=f'{font_name}-Bold')
-  return font_name
+  """Register bundled Comfortaa font, or Century Gothic, if available."""
+  try:
+    pdfmetrics.registerFont(TTFont('CenturyGothic', 'GOTHIC.ttf'))
+    pdfmetrics.registerFont(TTFont('CenturyGothic-Bold', 'GOTHICB.ttf'))
+    pdfmetrics.registerFontFamily('CenturyGothic', normal='CenturyGothic', bold='CenturyGothic-Bold')
+    return 'CenturyGothic'
+  except:
+    font_name = 'Comfortaa'
+    # Get the location of this module file and navigate to fonts directory
+    this_dir = Path(__file__).parent / 'fonts' 
+    font_regular = this_dir / 'Comfortaa-Regular.ttf'
+    font_bold = this_dir / 'Comfortaa-Bold.ttf'
+    pdfmetrics.registerFont(TTFont(font_name, str(font_regular)))
+    pdfmetrics.registerFont(TTFont(f'{font_name}-Bold', str(font_bold)))
+    pdfmetrics.registerFontFamily(font_name, normal=font_name, bold=f'{font_name}-Bold')
+    return font_name
 
 
 # Register bundled font
