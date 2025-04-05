@@ -712,21 +712,39 @@ def process_text_elements(c, root, all_paths, ns, font_to_use):
 
 def register_bundled_fonts():
   """Register bundled Comfortaa font, or Century Gothic, if available."""
-  try:
-    pdfmetrics.registerFont(TTFont('CenturyGothic', 'GOTHIC.ttf'))
-    pdfmetrics.registerFont(TTFont('CenturyGothic-Bold', 'GOTHICB.ttf'))
-    pdfmetrics.registerFontFamily('CenturyGothic', normal='CenturyGothic', bold='CenturyGothic-Bold')
-    return 'CenturyGothic'
-  except:
-    font_name = 'Comfortaa'
-    # Get the location of this module file and navigate to fonts directory
-    this_dir = Path(__file__).parent / 'fonts' 
-    font_regular = this_dir / 'Comfortaa-Regular.ttf'
-    font_bold = this_dir / 'Comfortaa-Bold.ttf'
-    pdfmetrics.registerFont(TTFont(font_name, str(font_regular)))
-    pdfmetrics.registerFont(TTFont(f'{font_name}-Bold', str(font_bold)))
-    pdfmetrics.registerFontFamily(font_name, normal=font_name, bold=f'{font_name}-Bold')
-    return font_name
+  # Common Century Gothic filenames across platforms
+  century_gothic_variations = [
+    # Windows standard names
+    ('GOTHIC.TTF', 'GOTHICB.TTF'),
+    ('gothic.ttf', 'gothicb.ttf'),
+    # macOS/Linux possible names
+    ('Century Gothic.ttf', 'Century Gothic Bold.ttf'),
+    ('CenturyGothic.ttf', 'CenturyGothic-Bold.ttf'),
+    ('CenturyGothic-Regular.ttf', 'CenturyGothic-Bold.ttf'),
+    # Other variations
+    ('century_gothic.ttf', 'century_gothic_bold.ttf'),
+    ('CenturyGothic.ttf', 'CenturyGothicBold.ttf')
+  ]
+  # Try to register Century Gothic with various filenames
+  for regular_name, bold_name in century_gothic_variations:
+    try:
+      # Try with just the filename (reportlab will find it in system fonts)
+      pdfmetrics.registerFont(TTFont('CenturyGothic', regular_name))
+      pdfmetrics.registerFont(TTFont('CenturyGothic-Bold', bold_name))
+      pdfmetrics.registerFontFamily('CenturyGothic', normal='CenturyGothic', bold='CenturyGothic-Bold')
+      return 'CenturyGothic'
+    except:
+      # Continue to next filename variation if this one fails
+      continue
+  font_name = 'Comfortaa'
+  # Get the location of this module file and navigate to fonts directory
+  this_dir = Path(__file__).parent / 'fonts' 
+  font_regular = this_dir / 'Comfortaa-Regular.ttf'
+  font_bold = this_dir / 'Comfortaa-Bold.ttf'
+  pdfmetrics.registerFont(TTFont(font_name, str(font_regular)))
+  pdfmetrics.registerFont(TTFont(f'{font_name}-Bold', str(font_bold)))
+  pdfmetrics.registerFontFamily(font_name, normal=font_name, bold=f'{font_name}-Bold')
+  return font_name
 
 
 # Register bundled font
