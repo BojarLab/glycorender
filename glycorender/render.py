@@ -407,26 +407,51 @@ def process_use_element(c, use_elem, all_paths, ns):
 
 
 def draw_radial_gradient_shape(c, cx, cy, r, stops, shape_func):
-  """Draw a radial gradient applied specifically to a shape."""
+  """Draw a radial gradient with extremely smooth appearance."""
+  # Sort stops by offset
   stops = sorted(stops, key=lambda x: x[0])
-  num_steps = 20
-  for i in range(len(stops)-1, 0, -1):
-    start_offset, start_color = stops[i-1]
-    end_offset, end_color = stops[i]
-    for step in range(num_steps):
-      fraction = step / num_steps
-      offset = start_offset + (end_offset - start_offset) * fraction
-      r_val = start_color[0] + (end_color[0] - start_color[0]) * fraction
-      g_val = start_color[1] + (end_color[1] - start_color[1]) * fraction
-      b_val = start_color[2] + (end_color[2] - start_color[2]) * fraction
-      # Scale opacity to maintain relative differences but reduce overall intensity
-      raw_opacity = start_color[3] + (end_color[3] - start_color[3]) * fraction
-      opacity = raw_opacity * 0.3  # Reduce opacity to achieve the subtler look
-      radius = r * offset
-      c.saveState()
-      c.setFillColorRGB(r_val, g_val, b_val, alpha=opacity)
-      shape_func(c, cx, cy, radius)
-      c.restoreState()
+  # First draw base with innermost color
+  innermost_color = stops[-1][1]
+  c.saveState()
+  c.setFillColorRGB(*innermost_color[:3], alpha=innermost_color[3] * 0.3)
+  shape_func(c, cx, cy, r)
+  c.restoreState()
+  # Large number of steps with linear spacing for smooth transition
+  # Adjust based on radius - more circles for bigger radii
+  num_steps = max(30, min(60, int(r * 1.2)))
+  # Store the max offset for proper scaling
+  max_offset = stops[-1][0]
+  # Create circles from largest to smallest
+  for i in range(num_steps):
+    # Linear position in 0-1 range
+    t = i / float(num_steps - 1)
+    # Calculate radius with very small changes between circles
+    # Keep slight spacing at center to avoid overcrowding
+    radius = r * (1.0 - 0.98 * t)
+    # Convert t to gradient position
+    gradient_pos = (1.0 - t) * max_offset
+    # Find segment in gradient this belongs to
+    for j in range(len(stops) - 1):
+      start_offset, start_color = stops[j]
+      end_offset, end_color = stops[j + 1]
+      if start_offset <= gradient_pos <= end_offset:
+        # Calculate position within this segment
+        segment_t = (gradient_pos - start_offset) / (end_offset - start_offset)
+        # Linear color interpolation
+        r_val = start_color[0] + (end_color[0] - start_color[0]) * segment_t
+        g_val = start_color[1] + (end_color[1] - start_color[1]) * segment_t
+        b_val = start_color[2] + (end_color[2] - start_color[2]) * segment_t
+        # Calculate very subtle opacity changes between adjacent circles
+        base_alpha = start_color[3] + (end_color[3] - start_color[3]) * segment_t
+        # Use gentle opacity curve for visually smooth transition
+        opacity = base_alpha * 0.3 * (0.2 + 0.8 * (1.0 - t))
+        # Only draw if visible
+        if radius > 0 and opacity > 0.0005:
+          c.saveState()
+          c.setFillColorRGB(r_val, g_val, b_val, alpha=opacity)
+          shape_func(c, cx, cy, radius)
+          c.restoreState()
+        break
 
 
 def parse_svg_dimensions(root):
