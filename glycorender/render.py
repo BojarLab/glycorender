@@ -15,6 +15,7 @@ from reportlab.graphics.shapes import Drawing
 import fitz
 from svglib.svglib import svg2rlg
 from io import BytesIO
+from PIL import Image, PngImagePlugin
 
 reportlab_colors = {
   'darkblue': (0, 0, 0.545),
@@ -839,11 +840,19 @@ def convert_svg_to_pdf(svg_data, pdf_file_path, return_canvas=False, chem=False)
   if chem:
     convert_chem_to_file(svg_data, pdf_file_path)
     return None
+  # Extract ALT text from SVG
+  aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
+  alt_text = aria_label_match.group(1) if aria_label_match else None
   root = ET.fromstring(svg_data)
   ns = {'svg': 'http://www.w3.org/2000/svg', 'xlink': 'http://www.w3.org/1999/xlink'}
   # Parse dimensions and set up canvas
   width, height, vb_x, vb_y, scale_x, scale_y = parse_svg_dimensions(root)
   c = canvas.Canvas(pdf_file_path, pagesize=(width, height))
+  if alt_text:
+    c.setTitle(alt_text.replace("SNFG diagram of ", "").split(" drawn in")[0])
+    c.setAuthor("GlycoDraw")
+    c.setSubject("Glycan Visualization")
+    c.setKeywords(f"glycan; carbohydrate; SNFG; glycowork; Description: {alt_text}")
   # Extract definitions and find connection paths
   all_paths, all_gradients = extract_defs(root, ns)
   connection_path_ids = find_connection_paths(root, all_paths, ns)
@@ -880,6 +889,9 @@ def convert_svg_to_png(svg_data, png_file_path=None, output_width=None, output_h
       return convert_chem_to_file(svg_data, png_file_path, return_bytes=True)
     convert_chem_to_file(svg_data, png_file_path)
     return None
+  # Extract ALT text from SVG
+  aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
+  alt_text = aria_label_match.group(1) if aria_label_match else None
   temp_pdf = None
   if png_file_path is None:
     with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
@@ -911,4 +923,10 @@ def convert_svg_to_png(svg_data, png_file_path=None, output_width=None, output_h
     pix.save(png_file_path)
     doc.close()
     os.remove(pdf_path)
+    # Add ALT text metadata to PNG using Pillow
+    if alt_text and png_file_path:
+      img = Image.open(png_file_path)
+      metadata = PngImagePlugin.PngInfo()
+      metadata.add_text("alt", alt_text)
+      img.save(png_file_path, pnginfo=metadata)
     return None
