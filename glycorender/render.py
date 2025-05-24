@@ -109,6 +109,8 @@ def point_at_length(points, target_length):
     x1, y1 = points[i]
     x2, y2 = points[i + 1]
     segment_length = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+    if segment_length == 0:
+        return (0, 0, 0)
     if current_length + segment_length >= target_length:
       # Point is on this segment
       t = (target_length - current_length) / segment_length
@@ -302,6 +304,8 @@ def draw_text_on_path(c, text, path_points, offset_percent, font_name, font_size
   total_length = path_length(path_points)
   target_length = total_length * (offset_percent / 100.0)
   x, y, angle = point_at_length(path_points, target_length)
+  if x == 0 and y == 0 and angle == 0:
+    return
   c.saveState()
   c.translate(x, y)
   c.rotate(angle)
@@ -852,7 +856,7 @@ def convert_svg_to_pdf(svg_data, pdf_file_path, return_canvas=False, chem=False)
     c.setTitle(alt_text.replace("SNFG diagram of ", "").split(" drawn in")[0])
     c.setAuthor("GlycoDraw")
     c.setSubject("Glycan Visualization")
-    c.setKeywords(f"glycan; carbohydrate; SNFG; glycowork; Description: {alt_text}")
+    c.setKeywords(f"glycan;carbohydrate;glycowork;Description: {alt_text}")
   # Extract definitions and find connection paths
   all_paths, all_gradients = extract_defs(root, ns)
   connection_path_ids = find_connection_paths(root, all_paths, ns)
