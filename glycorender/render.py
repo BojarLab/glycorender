@@ -10,12 +10,10 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.units import mm
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.graphics import renderPDF
-from reportlab.graphics.shapes import Drawing
 import fitz
-from svglib.svglib import svg2rlg
 from io import BytesIO
 from PIL import Image, PngImagePlugin
+from typing import Union
 
 reportlab_colors = {
   'darkblue': (0, 0, 0.545),
@@ -781,156 +779,194 @@ def register_bundled_fonts():
 font_to_use = register_bundled_fonts()
 
 
-def convert_chem_to_file(svg_data, file_path=None, return_bytes=False):
-  """
-  Convert a chemical 2D depiction from RDKit into a .pdf/.png
-  If return_bytes is True, returns the file contents as bytes instead of saving to disk.
-  """
-  width_match = re.search(r'width=[\'"](\d+)px[\'"]', svg_data)
-  height_match = re.search(r'height=[\'"](\d+)px[\'"]', svg_data)
-  width = int(width_match.group(1)) if width_match else 250
-  height = int(height_match.group(1)) if height_match else 250
-  svg_bytes = svg_data.encode('utf-8')
-  drawing = svg2rlg(BytesIO(svg_bytes))
-  drawing.width, drawing.height = width, height
-  # Determine output format based on file extension or default
-  ext = 'png' if file_path is None else file_path.lower().split('.')[-1]
-  # For PNG output
-  if ext == 'png':
-    # Create a temporary PDF
-    temp_pdf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-    temp_pdf_path = temp_pdf.name
-    temp_pdf.close()
-    # Create PDF
-    renderPDF.drawToFile(drawing, temp_pdf_path)
-    # Convert PDF to PNG using fitz
-    doc = fitz.open(temp_pdf_path)
+def _render_svg_to_pdf_canvas(svg_data: str, 
+                              pdf_target: Union[str, Path, BytesIO], 
+                              alt_text_info: Union[dict, None] = None) -> canvas.Canvas:
+    """
+    Core logic to parse SVG and render to a ReportLab Canvas.
+    Returns the canvas object, unsaved. The caller is responsible for saving.
+    """
+    if isinstance(svg_data, bytes):
+        svg_data = svg_data.decode('utf-8')
+    current_alt_text = None
+    if alt_text_info and 'alt_text' in alt_text_info:
+        current_alt_text = alt_text_info['alt_text']
+    else: # Try to extract from SVG if not provided
+        aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
+        if aria_label_match:
+            current_alt_text = aria_label_match.group(1)
+    root = ET.fromstring(svg_data)
+    ns = {'svg': 'http://www.w3.org/2000/svg', 'xlink': 'http://www.w3.org/1999/xlink'}
+    width, height, vb_x, vb_y, scale_x, scale_y = parse_svg_dimensions(root)
+    c = canvas.Canvas(pdf_target, pagesize=(width * mm, height * mm) if width <= 20 and height <=20 else (width, height)) # Heuristic for mm units for small SVGs
+    if current_alt_text:
+        c.setTitle(current_alt_text.replace("SNFG diagram of ", "").split(" drawn in")[0])
+        c.setAuthor("GlycoDraw") 
+        c.setSubject("Glycan Visualization")
+        c.setKeywords(f"glycan;carbohydrate;glycowork;Description: {current_alt_text}")
+    all_paths, all_gradients = extract_defs(root, ns)
+    connection_path_ids = find_connection_paths(root, all_paths, ns)
+    # Setup main canvas transform
+    c.translate(0, height) # Move origin to top-left for SVG-like Y-down coords
+    c.scale(1, -1)         # Flip Y-axis
+    # Apply viewBox transform (translate and scale)
+    c.translate(-vb_x * scale_x, -vb_y * scale_y)
+    c.scale(scale_x, scale_y)
+    # Handle global <g> transform if present
+    g_element = root.find('./svg:g', ns) # Only top-level <g>
+    if g_element is not None:
+        g_transform = g_element.get('transform', '')
+        if g_transform.startswith('rotate(90'):
+            pivot_match = re.search(r'rotate\(90\s+([-\d.]+)\s+([-\d.]+)\)', g_transform)
+            if pivot_match:
+                pivot_x, pivot_y = float(pivot_match.group(1)), float(pivot_match.group(2))
+                c.translate(pivot_x, pivot_y)
+                c.rotate(90)
+                c.translate(-pivot_x, -pivot_y)  
+    # Drawing order
+    draw_circles_with_gradients(c, root, all_gradients, ns)
+    draw_connection_paths(c, connection_path_ids, all_paths) # Connections
+    draw_rectangles(c, root, all_gradients, ns) # Rects
+    draw_circle_shapes(c, root, all_gradients, ns) # Circles (strokes, non-gradient fills)
+    draw_paths(c, root, connection_path_ids, all_gradients, ns) # Other paths
+    process_text_elements(c, root, all_paths, ns, font_to_use) # Text on top
+    return c # Return unsaved canvas
+
+
+def convert_chem_to_file(svg_data: str, file_path: Union[str, Path, None] = None, return_bytes: bool = False):
+    """
+    Convert a chemical 2D depiction SVG into a .pdf/.png using custom parser.
+    If return_bytes is True, returns the file contents as bytes.
+    Otherwise, saves to file_path.
+    """
+    output_ext = 'png' # Default if file_path is None (implies return_bytes for PNG)
+    if file_path:
+        output_ext = str(file_path).lower().split('.')[-1]
+    # Determine the target for the PDF canvas
+    # This can be a file path or a BytesIO buffer.
+    pdf_canvas_target: Union[str, Path, BytesIO]
+    temp_pdf_for_png_path: Union[str, None] = None # Path if PNG needs temp PDF file
+    if output_ext == 'pdf':
+        if return_bytes:
+            pdf_canvas_target = BytesIO()
+        else: # PDF to file
+            if file_path is None: raise ValueError("file_path must be provided for PDF output if not returning bytes.")
+            pdf_canvas_target = file_path
+    else: # PNG output
+        # PNG generation always needs an intermediate PDF.
+        # If returning bytes, use BytesIO for PDF if fitz can open it, else temp file.
+        # Fitz typically needs a filename or bytes, not a BytesIO stream object directly for open().
+        # So, always create a temporary PDF file for PNG generation.
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_f:
+            temp_pdf_for_png_path = tmp_f.name
+        pdf_canvas_target = temp_pdf_for_png_path
+    # Render SVG to PDF canvas (alt_text_info=None for chem)
+    canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_canvas_target, alt_text_info=None)
+    canvas_obj.save() # Save the canvas to the target (file or BytesIO buffer)
+    if output_ext == 'pdf':
+        if return_bytes:
+            # pdf_canvas_target is BytesIO, get its value
+            pdf_data = pdf_canvas_target.getvalue() # type: ignore 
+            pdf_canvas_target.close() # type: ignore
+            return pdf_data
+        else:
+            # PDF was written to file_path directly.
+            return None # Function returns None when saving to file
+    # output_ext == 'png'
+    # Intermediate PDF was saved to temp_pdf_for_png_path
+    if temp_pdf_for_png_path is None: # Should not happen due to logic above
+        raise Exception("Internal error: temp PDF path for PNG not set.")
+    doc = fitz.open(temp_pdf_for_png_path)
     page = doc.load_page(0)
-    pix = page.get_pixmap(dpi=300)  # Adjust DPI for quality
+    pix = page.get_pixmap(dpi=300) # Maintain original DPI for chem PNGs
+    png_result_data: Union[bytes, None] = None
     if return_bytes:
-      png_bytes = pix.tobytes("png")
-      doc.close()
-      os.unlink(temp_pdf_path)
-      return png_bytes
-    else:
-      pix.save(file_path)
-      doc.close()
-      os.unlink(temp_pdf_path)
-      return None
-  # For PDF output
-  else:
-    if return_bytes:
-      # Create a temporary file for PDF
-      temp_pdf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-      temp_pdf_path = temp_pdf.name
-      temp_pdf.close()
-      # Generate the PDF
-      renderPDF.drawToFile(drawing, temp_pdf_path)
-      # Read the file contents
-      with open(temp_pdf_path, 'rb') as f:
-        pdf_bytes = f.read()
-      # Clean up
-      os.unlink(temp_pdf_path)
-      return pdf_bytes
-    else:
-      renderPDF.drawToFile(drawing, file_path)
-      return None
+        png_result_data = pix.tobytes("png")
+    else: # Save to file
+        if file_path is None: raise ValueError("file_path must be provided for PNG output if not returning bytes.")
+        pix.save(str(file_path))
+    doc.close()
+    os.unlink(temp_pdf_for_png_path) # Clean up temporary PDF file
+    return png_result_data if return_bytes else None
 
 
-def convert_svg_to_pdf(svg_data, pdf_file_path, return_canvas=False, chem=False):
+def convert_svg_to_pdf(svg_data: str, pdf_file_path: Union[str, Path], return_canvas: bool = False, chem: bool = False):
   """Convert SVG to PDF with text path support."""
-  if isinstance(svg_data, bytes):
-    svg_data = svg_data.decode('utf-8')
   if chem:
-    convert_chem_to_file(svg_data, pdf_file_path)
+    # Delegate to convert_chem_to_file, ensuring it saves to pdf_file_path
+    convert_chem_to_file(svg_data, file_path=pdf_file_path, return_bytes=False)
     return None
-  # Extract ALT text from SVG
-  aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
-  alt_text = aria_label_match.group(1) if aria_label_match else None
-  root = ET.fromstring(svg_data)
-  ns = {'svg': 'http://www.w3.org/2000/svg', 'xlink': 'http://www.w3.org/1999/xlink'}
-  # Parse dimensions and set up canvas
-  width, height, vb_x, vb_y, scale_x, scale_y = parse_svg_dimensions(root)
-  c = canvas.Canvas(pdf_file_path, pagesize=(width, height))
-  if alt_text:
-    c.setTitle(alt_text.replace("SNFG diagram of ", "").split(" drawn in")[0])
-    c.setAuthor("GlycoDraw")
-    c.setSubject("Glycan Visualization")
-    c.setKeywords(f"glycan;carbohydrate;glycowork;Description: {alt_text}")
-  # Extract definitions and find connection paths
-  all_paths, all_gradients = extract_defs(root, ns)
-  connection_path_ids = find_connection_paths(root, all_paths, ns)
-  # Set up canvas transformation
-  c.translate(0, height)
-  c.scale(1, -1)
-  c.translate(-vb_x * scale_x, -vb_y * scale_y)
-  c.scale(scale_x, scale_y)
-  g_transform = root.find('.//{http://www.w3.org/2000/svg}g').get('transform', '')
-  if g_transform.startswith('rotate(90'):
-    pivot_match = re.search(r'rotate\(90\s+([-\d.]+)\s+([-\d.]+)', g_transform)
-    if pivot_match:
-      pivot_x, pivot_y = float(pivot_match.group(1)), float(pivot_match.group(2))
-      c.translate(pivot_x, pivot_y)
-      c.rotate(90)
-      c.translate(-pivot_x, -pivot_y)
-  # Draw elements in the correct order
-  draw_circles_with_gradients(c, root, all_gradients, ns)
-  draw_connection_paths(c, connection_path_ids, all_paths)
-  draw_circle_shapes(c, root, all_gradients, ns)
-  draw_rectangles(c, root, all_gradients, ns)
-  draw_paths(c, root, connection_path_ids, all_gradients, ns)
-  process_text_elements(c, root, all_paths, ns, font_to_use)
+  # Non-chem path:
+  # _render_svg_to_pdf_canvas will extract aria-label itself if alt_text_info is not passed.
+  canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_file_path) 
   if return_canvas:
-    return c
-  c.save()
+    # Caller is responsible for saving the canvas.
+    return canvas_obj
+  else:
+    canvas_obj.save()
+    return None
 
 
-def convert_svg_to_png(svg_data, png_file_path=None, output_width=None, output_height=None, scale=None, return_bytes=False,
-                       chem=False):
+def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = None, 
+                       output_width: Union[int, None] = None, output_height: Union[int, None] = None, 
+                       scale: Union[float, None] = None, return_bytes: bool = False,
+                       chem: bool = False):
   """Convert SVG to PNG with pymupdf, with support for scaling and dimensions."""
   if chem:
-    if return_bytes:
-      return convert_chem_to_file(svg_data, png_file_path, return_bytes=True)
-    convert_chem_to_file(svg_data, png_file_path)
-    return None
-  # Extract ALT text from SVG
+    return convert_chem_to_file(svg_data, file_path=png_file_path, return_bytes=return_bytes)
+  # Non-chem path:
+  if not return_bytes and png_file_path is None:
+      raise ValueError("png_file_path must be provided if return_bytes is False.")
+  # Extract ALT text from SVG for PDF metadata and PNG metadata
   aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
   alt_text = aria_label_match.group(1) if aria_label_match else None
-  temp_pdf = None
-  if png_file_path is None:
-    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-      temp_pdf = tmp.name
-      pdf_path = temp_pdf
-  else:
-    pdf_path = f"{png_file_path.split('.')[0]}.pdf"
-  canvas_object = convert_svg_to_pdf(svg_data, pdf_path, return_canvas=True)
-  canvas_object.save()
-  doc = fitz.open(canvas_object._filename)
+  alt_text_payload = {'alt_text': alt_text} if alt_text else None
+  # Determine path for intermediate PDF
+  temp_pdf_for_conversion: str
+  if png_file_path: # If final PNG path is known, derive temp PDF name
+      temp_pdf_for_conversion = f"{os.path.splitext(str(png_file_path))[0]}.pdf"
+  else: # Final PNG path not known (must be return_bytes=True), use tempfile name
+      with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+          temp_pdf_for_conversion = tmp.name
+  # Generate the intermediate PDF using the core rendering logic
+  canvas_obj = _render_svg_to_pdf_canvas(svg_data, temp_pdf_for_conversion, alt_text_info=alt_text_payload)
+  canvas_obj.save()
+  # Convert PDF to PNG using fitz
+  doc = fitz.open(temp_pdf_for_conversion)
   page = doc[0]
-  zoom_matrix = fitz.Matrix(1, 1)
+  # Refined scaling logic
+  page_rect = page.rect
+  page_width = page_rect.width if page_rect.width > 0.001 else 1.0
+  page_height = page_rect.height if page_rect.height > 0.001 else 1.0
+  zoom_x, zoom_y = 1.0, 1.0
   if scale is not None:
-    zoom_matrix = fitz.Matrix(scale, scale)
-  elif output_width is not None or output_height is not None:
-    page_rect = page.rect
-    page_width, page_height = page_rect.width, page_rect.height
-    scale_x = output_width / page_width if output_width else 1
-    scale_y = output_height / page_height if output_height else 1
-    zoom_matrix = fitz.Matrix(scale_x, scale_y)
+      zoom_x = zoom_y = scale
+  elif output_width is not None and output_height is not None:
+      zoom_x = output_width / page_width
+      zoom_y = output_height / page_height
+  elif output_width is not None:
+      zoom_x = zoom_y = output_width / page_width
+  elif output_height is not None:
+      zoom_x = zoom_y = output_height / page_height
+  zoom_matrix = fitz.Matrix(zoom_x, zoom_y)
   pix = page.get_pixmap(matrix=zoom_matrix)
+  png_data_bytes: Union[bytes, None] = None
   if return_bytes:
-    png_data = pix.tobytes("png")
-    doc.close()
-    if temp_pdf:
-      os.remove(temp_pdf)
-    return png_data
-  else:
-    pix.save(png_file_path)
-    doc.close()
-    os.remove(pdf_path)
-    # Add ALT text metadata to PNG using Pillow
-    if alt_text and png_file_path:
-      img = Image.open(png_file_path)
-      metadata = PngImagePlugin.PngInfo()
-      metadata.add_text("alt", alt_text)
-      img.save(png_file_path, pnginfo=metadata)
-    return None
+      png_data_bytes = pix.tobytes("png")
+  else: # Save to file (png_file_path is guaranteed to be not None here)
+      pix.save(str(png_file_path))
+  doc.close()
+  os.remove(temp_pdf_for_conversion) # Clean up intermediate PDF
+  if return_bytes:
+      return png_data_bytes
+  else: # Saved to file, now add ALT text metadata to PNG
+      if alt_text and png_file_path:
+          try:
+              img = Image.open(str(png_file_path))
+              img.load() 
+              metadata = PngImagePlugin.PngInfo()
+              metadata.add_text("alt", alt_text) # Using "alt" as key, common for accessibility.
+              img.save(str(png_file_path), pnginfo=metadata)
+          except Exception:
+              pass # Silently ignore if metadata addition fails
+      return None
