@@ -10,10 +10,14 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.units import mm
 from reportlab.pdfbase.ttfonts import TTFont
-import fitz
+try:
+    import fitz  # PyMuPDF
+    FITZ_AVAILABLE = True
+except ImportError:
+    FITZ_AVAILABLE = False
 from io import BytesIO
 from PIL import Image, PngImagePlugin
-from typing import Union
+from typing import Union, List, Tuple, Any, Dict
 
 reportlab_colors = {
   'darkblue': (0, 0, 0.545),
@@ -139,10 +143,9 @@ def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1):
       c.setFillColorRGB(*fill_color[:3], alpha=fill_color[3])
   is_diamond = False
   points = []
-  if len(commands) == 5:  # M + 3 L + Z potentially
+  if len(commands) == 5:
     cmd_types = [cmd for cmd, _ in commands]
-    if cmd_types[0] in ['M', 'm'] and cmd_types[-1] in ['Z', 'z'] and all(c in ['L', 'l'] for c in cmd_types[1:-1]):
-      # Extract points for possible diamond
+    if cmd_types[0] in ['M', 'm'] and cmd_types[-1] in ['Z', 'z'] and all(c_val in ['L', 'l'] for c_val in cmd_types[1:-1]):
       curr_x, curr_y = 0, 0
       for cmd, params in commands:
         if cmd == 'M':
@@ -161,28 +164,22 @@ def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1):
           points.append((curr_x, curr_y))
       if len(points) == 4:
         is_diamond = True
-  # Check if this is a bracket part
   is_bracket = False
   if len(commands) == 2:
     cmd1, params1 = commands[0]
     cmd2, params2 = commands[1]
     if cmd1 == 'M' and cmd2 in ['L', 'V', 'H']:
-      # Vertical line in bracket
       if cmd2 == 'V' or (cmd2 == 'L' and len(params2) >= 2 and abs(params1[0] - params2[0]) < 0.1):
         is_bracket = True
-      # Horizontal line in bracket
       elif cmd2 == 'H' or (cmd2 == 'L' and len(params2) >= 2 and abs(params1[1] - params2[1]) < 0.1 and abs(params1[0] - params2[0]) < 15):
         is_bracket = True
   if is_bracket:
-    # For bracket components
-    c.setLineJoin(0)  # Mitered joins
-    c.setLineCap(0)   # Butt caps
+    c.setLineJoin(0)
+    c.setLineCap(0)
   else:
-    # For diamonds, connections, and other shapes
-    c.setLineJoin(1)  # Round joins
-    # For connection paths with stroke_width=4.0, use round caps
+    c.setLineJoin(1)
     if stroke_width == 4.0 and not fill_color:
-      c.setLineCap(1)  # Round caps
+      c.setLineCap(1)
   if is_diamond:
     path = c.beginPath()
     for i, (x, y) in enumerate(points):
@@ -193,60 +190,110 @@ def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1):
     path.close()
   else:
     path = c.beginPath()
-    curr_x, curr_y = 0, 0
+    curr_x, curr_y = 0.0, 0.0 # Ensure float for calculations
     start_x, start_y = None, None
     first_x, first_y = None, None
+    last_cmd_processed = None
     for cmd, params in commands:
       if cmd == 'M':
         for i in range(0, len(params), 2):
-          curr_x, curr_y = params[i], params[i+1]
-          if first_x is None:
-            first_x, first_y = curr_x, curr_y
-          if start_x is None:
-            start_x, start_y = curr_x, curr_y
+          curr_x, curr_y = float(params[i]), float(params[i+1])
+          if first_x is None: first_x, first_y = curr_x, curr_y
+          if start_x is None or i == 0: start_x, start_y = curr_x, curr_y
           path.moveTo(curr_x, curr_y)
       elif cmd == 'm':
         for i in range(0, len(params), 2):
-          curr_x += params[i]
-          curr_y += params[i+1]
-          if first_x is None:
-            first_x, first_y = curr_x, curr_y
-          if start_x is None:
-            start_x, start_y = curr_x, curr_y
+          dx, dy = float(params[i]), float(params[i+1])
+          if start_x is None or i == 0: # First 'm' may be relative to an implicit (0,0) if path starts with 'm'
+              # Or if 'm' follows Z, curr_x, curr_y would be start_x, start_y of closed subpath
+              # For simplicity, assume curr_x, curr_y is correctly set from previous command or (0,0)
+              pass
+          curr_x += dx; curr_y += dy
+          if first_x is None: first_x, first_y = curr_x, curr_y
+          if start_x is None or i == 0: start_x, start_y = curr_x, curr_y
           path.moveTo(curr_x, curr_y)
       elif cmd == 'L':
         for i in range(0, len(params), 2):
-          curr_x, curr_y = params[i], params[i+1]
+          curr_x, curr_y = float(params[i]), float(params[i+1])
           path.lineTo(curr_x, curr_y)
       elif cmd == 'l':
         for i in range(0, len(params), 2):
-          curr_x += params[i]
-          curr_y += params[i+1]
+          dx, dy = float(params[i]), float(params[i+1])
+          curr_x += dx; curr_y += dy
           path.lineTo(curr_x, curr_y)
       elif cmd == 'H':
         for param in params:
-          curr_x = param
-          path.lineTo(curr_x, curr_y)
+          curr_x = float(param); path.lineTo(curr_x, curr_y)
       elif cmd == 'h':
         for param in params:
-          curr_x += param
-          path.lineTo(curr_x, curr_y)
+          curr_x += float(param); path.lineTo(curr_x, curr_y)
       elif cmd == 'V':
         for param in params:
-          curr_y = param
-          path.lineTo(curr_x, curr_y)
+          curr_y = float(param); path.lineTo(curr_x, curr_y)
       elif cmd == 'v':
         for param in params:
-          curr_y += param
-          path.lineTo(curr_x, curr_y)
+          curr_y += float(param); path.lineTo(curr_x, curr_y)
+      elif cmd == 'Q': # Quadratic Bezier
+        # A Q command has (x1 y1 x y)+ parameters. x1,y1 is control, x,y is endpoint.
+        # Loop if multiple Q segments are chained (e.g., Q c1_1,e1_1 c1_2,e2_2)
+        for i in range(0, len(params), 4):
+            x1, y1 = float(params[i]), float(params[i+1]) # control point
+            x, y = float(params[i+2]), float(params[i+3]) # end point
+            # Convert quadratic (x0,y0)-(x1,y1)-(x,y) to cubic for path.curveTo
+            # Current point (curr_x, curr_y) is x0, y0
+            c1x = curr_x + 2.0/3.0 * (x1 - curr_x)
+            c1y = curr_y + 2.0/3.0 * (y1 - curr_y)
+            c2x = x + 2.0/3.0 * (x1 - x)
+            c2y = y + 2.0/3.0 * (y1 - y)
+            path.curveTo(c1x, c1y, c2x, c2y, x, y)
+            curr_x, curr_y = x, y # Update current point
+      elif cmd == 'q': # Relative Quadratic Bezier
+        for i in range(0, len(params), 4):
+            dx1, dy1 = float(params[i]), float(params[i+1])
+            dx, dy = float(params[i+2]), float(params[i+3])
+            # Absolute control point
+            x1_abs = curr_x + dx1
+            y1_abs = curr_y + dy1
+            # Absolute end point
+            x_abs = curr_x + dx
+            y_abs = curr_y + dy
+            # Convert quadratic to cubic
+            c1x = curr_x + 2.0/3.0 * (x1_abs - curr_x)
+            c1y = curr_y + 2.0/3.0 * (y1_abs - curr_y)
+            c2x = x_abs + 2.0/3.0 * (x1_abs - x_abs)
+            c2y = y_abs + 2.0/3.0 * (y1_abs - y_abs)
+            path.curveTo(c1x, c1y, c2x, c2y, x_abs, y_abs)
+            curr_x, curr_y = x_abs, y_abs
+      elif cmd == 'C': # Cubic Bezier
+        for i in range(0, len(params), 6):
+            x1, y1 = float(params[i]), float(params[i+1])
+            x2, y2 = float(params[i+2]), float(params[i+3])
+            x, y = float(params[i+4]), float(params[i+5])
+            path.curveTo(x1, y1, x2, y2, x, y)
+            curr_x, curr_y = x, y
+      elif cmd == 'c': # Relative Cubic Bezier
+        for i in range(0, len(params), 6):
+            dx1, dy1 = float(params[i]), float(params[i+1])
+            dx2, dy2 = float(params[i+2]), float(params[i+3])
+            dx, dy = float(params[i+4]), float(params[i+5])
+            x1_abs, y1_abs = curr_x + dx1, curr_y + dy1
+            x2_abs, y2_abs = curr_x + dx2, curr_y + dy2
+            x_abs, y_abs = curr_x + dx, curr_y + dy
+            path.curveTo(x1_abs, y1_abs, x2_abs, y2_abs, x_abs, y_abs)
+            curr_x, curr_y = x_abs, y_abs
+      # Note: 'S', 's' (smooth cubic), 'T', 't' (smooth quadratic) and 'A', 'a' (arc) are NOT handled here yet.
+      # 'S' and 'T' rely on reflection of previous control points.
+      # 'A' is complex to convert to Beziers.
       elif cmd == 'Z' or cmd == 'z':
-        if first_x is not None and first_y is not None:
-          path.lineTo(first_x, first_y)
+        if start_x is not None and start_y is not None:
+          path.lineTo(start_x, start_y)
         path.close()
-    if first_x is not None and (cmd != 'Z' and cmd != 'z') and (curr_x != first_x or curr_y != first_y):
+        if start_x is not None: curr_x, curr_y = start_x, start_y
+      last_cmd_processed = cmd
+    if first_x is not None and (last_cmd_processed != 'Z' and last_cmd_processed != 'z') and \
+       (abs(curr_x - first_x) > 1e-3 or abs(curr_y - first_y) > 1e-3): # Added tolerance for float comparison
       path.lineTo(first_x, first_y)
       path.close()
-  # Draw path with fill if fill color is provided, regardless of stroke width
   if fill_color and isinstance(fill_color, tuple):
     c.drawPath(path, fill=1, stroke=(stroke_color is not None and isinstance(stroke_color, tuple)))
   elif stroke_color and isinstance(stroke_color, tuple):
@@ -481,76 +528,147 @@ def parse_svg_dimensions(root):
   return width, height, vb_x, vb_y, scale_x, scale_y
 
 
+def _parse_inline_style(style_str: str) -> Dict[str, str]: # Helper
+    """Rudimentary parser for inline style attributes."""
+    properties = {}
+    if not style_str:
+        return properties
+    for item in style_str.strip().split(';'):
+        if item and ':' in item:
+            key, value = item.split(':', 1)
+            properties[key.strip()] = value.strip()
+    return properties
+
+
 def extract_defs(root, ns):
-  """Extract definitions like paths and gradients from SVG."""
   all_paths = {}
   all_gradients = {}
   for defs in root.findall('.//svg:defs', ns):
-    # Extract paths
     for path in defs.findall('.//svg:path', ns):
       path_id = path.get('id', '')
       if not path_id:
         continue
       path_data = path.get('d', '')
-      stroke = parse_color(path.get('stroke', 'none'))
-      fill = parse_color(path.get('fill', 'none'))
-      stroke_width = float(path.get('stroke-width', '1'))
+      style_props = _parse_inline_style(path.get('style', ''))
+      raw_fill = style_props.get('fill', path.get('fill'))
+      raw_stroke = style_props.get('stroke', path.get('stroke'))
+      raw_stroke_width = style_props.get('stroke-width', path.get('stroke-width', '1'))
+      raw_fill_opacity = style_props.get('fill-opacity', path.get('fill-opacity')) # Added
+      raw_stroke_opacity = style_props.get('stroke-opacity', path.get('stroke-opacity')) # Added
+      fill_val = parse_color(raw_fill if raw_fill is not None else ('black' if not raw_stroke and not style_props.get('stroke') else 'none'))
+      stroke_val = parse_color(raw_stroke if raw_stroke is not None else 'none')
+      try:
+          stroke_width_val = float(str(raw_stroke_width).replace('px','')) if raw_stroke_width else 1.0
+      except ValueError:
+          stroke_width_val = 1.0
+      final_fill = None # Process opacity
+      if fill_val and isinstance(fill_val, tuple):
+          alpha_f = 1.0
+          if raw_fill_opacity:
+              try: alpha_f = float(raw_fill_opacity)
+              except ValueError: pass
+          final_fill = fill_val + (alpha_f,) if len(fill_val) == 3 else (fill_val[0],fill_val[1],fill_val[2], min(fill_val[3], alpha_f) if len(fill_val) == 4 else alpha_f)
+      elif isinstance(fill_val, str): final_fill = fill_val
+      final_stroke = None # Process opacity
+      if stroke_val and isinstance(stroke_val, tuple):
+          alpha_s = 1.0
+          if raw_stroke_opacity:
+              try: alpha_s = float(raw_stroke_opacity)
+              except ValueError: pass
+          final_stroke = stroke_val + (alpha_s,) if len(stroke_val) == 3 else (stroke_val[0],stroke_val[1],stroke_val[2], min(stroke_val[3], alpha_s) if len(stroke_val) == 4 else alpha_s)
       path_commands = parse_path(path_data)
       path_points = calculate_points(path_commands)
       all_paths[path_id] = {
-        'points': path_points,
-        'commands': path_commands,
-        'stroke': stroke,
-        'fill': fill,
-        'stroke_width': stroke_width
+        'points': path_points, 'commands': path_commands,
+        'stroke': final_stroke, 'fill': final_fill, 'stroke_width': stroke_width_val
       }
-    # Extract radial gradients
     for radial_gradient in defs.findall('.//svg:radialGradient', ns):
       gradient_id = radial_gradient.get('id', '')
-      if not gradient_id:
-        continue
-      cx = float(radial_gradient.get('cx', '0'))
-      cy = float(radial_gradient.get('cy', '0'))
-      r = float(radial_gradient.get('r', '0'))
+      if not gradient_id: continue
+      cx = float(radial_gradient.get('cx', '0.5').replace('%',''))/100 if '%' in radial_gradient.get('cx','0.5') else float(radial_gradient.get('cx','0.5'))
+      cy = float(radial_gradient.get('cy', '0.5').replace('%',''))/100 if '%' in radial_gradient.get('cy','0.5') else float(radial_gradient.get('cy','0.5'))
+      r_grad = float(radial_gradient.get('r', '0.5').replace('%',''))/100 if '%' in radial_gradient.get('r','0.5') else float(radial_gradient.get('r','0.5'))
       stops = []
       for stop in radial_gradient.findall('.//svg:stop', ns):
-        offset = float(stop.get('offset', '0'))
-        stop_color = stop.get('stop-color', 'white')
+        offset = float(stop.get('offset', '0').replace('%',''))/100 if '%' in stop.get('offset','0') else float(stop.get('offset','0'))
+        stop_color_str = stop.get('stop-color', 'white')
         opacity = float(stop.get('stop-opacity', '1'))
         color_tuple = None
-        if stop_color.startswith('#'):
-          if len(stop_color) == 7:  # #RRGGBB
-            r_val = int(stop_color[1:3], 16) / 255.0
-            g_val = int(stop_color[3:5], 16) / 255.0
-            b_val = int(stop_color[5:7], 16) / 255.0
-            color_tuple = (r_val, g_val, b_val, opacity)
-        elif stop_color in reportlab_colors:
-          base_color = reportlab_colors[stop_color]
-          color_tuple = base_color + (opacity,)
-        if color_tuple:
-          stops.append((offset, color_tuple))
-      all_gradients[gradient_id] = {'cx': cx, 'cy': cy, 'r': r,'stops': stops}
-  # Also process direct paths with stroke-width="4.0" not in defs
-  for path in root.findall('.//svg:path', ns):
+        style_props_stop = _parse_inline_style(stop.get('style',''))
+        if 'stop-color' in style_props_stop: stop_color_str = style_props_stop['stop-color']
+        if 'stop-opacity' in style_props_stop:
+            try: opacity = float(style_props_stop['stop-opacity'])
+            except ValueError: pass
+        parsed_stop_color = parse_color(stop_color_str)
+        if parsed_stop_color and isinstance(parsed_stop_color, tuple):
+            color_tuple = parsed_stop_color + (opacity,)
+        elif stop_color_str.startswith('#'):
+            if len(stop_color_str) == 7:
+                r_val = int(stop_color_str[1:3],16)/255.0; g_val=int(stop_color_str[3:5],16)/255.0; b_val=int(stop_color_str[5:7],16)/255.0
+                color_tuple = (r_val,g_val,b_val,opacity)
+        if color_tuple: stops.append((offset, color_tuple))
+      all_gradients[gradient_id] = {'cx': cx, 'cy': cy, 'r': r_grad,'stops': stops}
+  for path in root.findall('.//svg:path', ns): # Connection path logic
+    # RDKit bonds usually defined by class, e.g. "bond-0" and explicit style.
     if path.get('stroke-width') == '4.0':
-      parent = path.find('..')
-      if parent is not None and parent.tag.endswith('defs'):
-        continue  # Skip if in defs (already processed)
-      path_id = f"connection_{len(all_paths)}"  # Generate unique ID
+      is_in_defs_check = any(path in list(defs_node_check) for defs_node_check in root.findall('.//svg:defs', ns))
+      if is_in_defs_check: continue
+      path_id = path.get('id', f"connection_{len(all_paths)}")
       path_data = path.get('d', '')
-      stroke = parse_color(path.get('stroke', 'none'))
-      fill = parse_color(path.get('fill', 'none'))
-      stroke_width = float(path.get('stroke-width', '1'))
+      style_props_conn = _parse_inline_style(path.get('style', ''))
+      raw_fill_conn = style_props_conn.get('fill', path.get('fill'))
+      raw_stroke_conn = style_props_conn.get('stroke', path.get('stroke'))
+      raw_stroke_width_conn = style_props_conn.get('stroke-width', path.get('stroke-width'))
+      raw_fill_opacity_conn = style_props_conn.get('fill-opacity', path.get('fill-opacity'))
+      raw_stroke_opacity_conn = style_props_conn.get('stroke-opacity', path.get('stroke-opacity'))
+      fill_val_conn = parse_color(raw_fill_conn if raw_fill_conn is not None else ('black' if not raw_stroke_conn and not style_props_conn.get('stroke') else 'none'))
+      stroke_val_conn = parse_color(raw_stroke_conn if raw_stroke_conn is not None else 'none')
+      try:
+          stroke_width_val_conn = float(str(raw_stroke_width_conn).replace('px','')) if raw_stroke_width_conn else 4.0
+      except ValueError: stroke_width_val_conn = 4.0
+      final_fill_conn = None
+      if fill_val_conn and isinstance(fill_val_conn, tuple):
+          alpha_f_conn = 1.0
+          if raw_fill_opacity_conn:
+              try: alpha_f_conn = float(raw_fill_opacity_conn)
+              except ValueError: pass
+          final_fill_conn = fill_val_conn + (alpha_f_conn,) if len(fill_val_conn) == 3 else (fill_val_conn[0],fill_val_conn[1],fill_val_conn[2],min(fill_val_conn[3], alpha_f_conn) if len(fill_val_conn) == 4 else alpha_f_conn)
+      elif isinstance(fill_val_conn, str): final_fill_conn = fill_val_conn
+      final_stroke_conn = None
+      if stroke_val_conn and isinstance(stroke_val_conn, tuple):
+          alpha_s_conn = 1.0
+          if raw_stroke_opacity_conn:
+              try: alpha_s_conn = float(raw_stroke_opacity_conn)
+              except ValueError: pass
+          final_stroke_conn = stroke_val_conn + (alpha_s_conn,) if len(stroke_val_conn) == 3 else (stroke_val_conn[0],stroke_val_conn[1],stroke_val_conn[2],min(stroke_val_conn[3], alpha_s_conn) if len(stroke_val_conn) == 4 else alpha_s_conn)
       path_commands = parse_path(path_data)
       path_points = calculate_points(path_commands)
       all_paths[path_id] = {
-        'points': path_points,
-        'commands': path_commands,
-        'stroke': stroke,
-        'fill': fill,
-        'stroke_width': stroke_width
+        'points': path_points, 'commands': path_commands,
+        'stroke': final_stroke_conn, 'fill': final_fill_conn, 'stroke_width': stroke_width_val_conn
       }
   return all_paths, all_gradients
+
+
+def draw_ellipse(c, cx, cy, rx, ry, stroke_color=None, fill_color=None, stroke_width=1):
+  c.saveState()
+  if stroke_color and isinstance(stroke_color, tuple):
+    c.setStrokeColorRGB(*stroke_color)
+    c.setLineWidth(stroke_width)
+  if fill_color and isinstance(fill_color, tuple):
+    if len(fill_color) == 3:
+      c.setFillColorRGB(*fill_color)
+    elif len(fill_color) == 4:
+      c.setFillColorRGB(*fill_color[:3], alpha=fill_color[3])
+  x = cx - rx
+  y = cy - ry
+  width = 2 * rx
+  height = 2 * ry
+  do_fill = fill_color and isinstance(fill_color, tuple)
+  do_stroke = stroke_color and isinstance(stroke_color, tuple)
+  if do_fill or do_stroke:
+      c.ellipse(x, y, x + width, y + height, fill=1 if do_fill else 0, stroke=1 if do_stroke else 0)
+  c.restoreState()
 
 
 def find_connection_paths(root, all_paths, ns):
@@ -779,41 +897,34 @@ def register_bundled_fonts():
 font_to_use = register_bundled_fonts()
 
 
-def _render_svg_to_pdf_canvas(svg_data: str, 
-                              pdf_target: Union[str, Path, BytesIO], 
+def _render_svg_to_pdf_canvas(svg_data: str,
+                              pdf_target: Union[str, Path, BytesIO],
                               alt_text_info: Union[dict, None] = None) -> canvas.Canvas:
-    """
-    Core logic to parse SVG and render to a ReportLab Canvas.
-    Returns the canvas object, unsaved. The caller is responsible for saving.
-    """
     if isinstance(svg_data, bytes):
         svg_data = svg_data.decode('utf-8')
     current_alt_text = None
     if alt_text_info and 'alt_text' in alt_text_info:
         current_alt_text = alt_text_info['alt_text']
-    else: # Try to extract from SVG if not provided
+    else:
         aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
         if aria_label_match:
             current_alt_text = aria_label_match.group(1)
     root = ET.fromstring(svg_data)
     ns = {'svg': 'http://www.w3.org/2000/svg', 'xlink': 'http://www.w3.org/1999/xlink'}
     width, height, vb_x, vb_y, scale_x, scale_y = parse_svg_dimensions(root)
-    c = canvas.Canvas(pdf_target, pagesize=(width * mm, height * mm) if width <= 20 and height <=20 else (width, height)) # Heuristic for mm units for small SVGs
+    c = canvas.Canvas(pdf_target, pagesize=(width * mm, height * mm) if width <= 20 and height <=20 else (width, height))
     if current_alt_text:
         c.setTitle(current_alt_text.replace("SNFG diagram of ", "").split(" drawn in")[0])
-        c.setAuthor("GlycoDraw") 
+        c.setAuthor("GlycoDraw")
         c.setSubject("Glycan Visualization")
         c.setKeywords(f"glycan;carbohydrate;glycowork;Description: {current_alt_text}")
     all_paths, all_gradients = extract_defs(root, ns)
     connection_path_ids = find_connection_paths(root, all_paths, ns)
-    # Setup main canvas transform
-    c.translate(0, height) # Move origin to top-left for SVG-like Y-down coords
-    c.scale(1, -1)         # Flip Y-axis
-    # Apply viewBox transform (translate and scale)
+    c.translate(0, height)
+    c.scale(1, -1)
     c.translate(-vb_x * scale_x, -vb_y * scale_y)
     c.scale(scale_x, scale_y)
-    # Handle global <g> transform if present
-    g_element = root.find('./svg:g', ns) # Only top-level <g>
+    g_element = root.find('./svg:g', ns)
     if g_element is not None:
         g_transform = g_element.get('transform', '')
         if g_transform.startswith('rotate(90'):
@@ -822,122 +933,281 @@ def _render_svg_to_pdf_canvas(svg_data: str,
                 pivot_x, pivot_y = float(pivot_match.group(1)), float(pivot_match.group(2))
                 c.translate(pivot_x, pivot_y)
                 c.rotate(90)
-                c.translate(-pivot_x, -pivot_y)  
-    # Drawing order
+                c.translate(-pivot_x, -pivot_y)
     draw_circles_with_gradients(c, root, all_gradients, ns)
-    draw_connection_paths(c, connection_path_ids, all_paths) # Connections
-    draw_rectangles(c, root, all_gradients, ns) # Rects
-    draw_circle_shapes(c, root, all_gradients, ns) # Circles (strokes, non-gradient fills)
-    draw_paths(c, root, connection_path_ids, all_gradients, ns) # Other paths
-    process_text_elements(c, root, all_paths, ns, font_to_use) # Text on top
-    return c # Return unsaved canvas
+    draw_connection_paths(c, connection_path_ids, all_paths)
+    for circle_element in root.findall('.//svg:circle', ns):
+        style_props_c = _parse_inline_style(circle_element.get('style', ''))
+        raw_fill_c_attr = circle_element.get('fill')
+        raw_fill_c = style_props_c.get('fill', raw_fill_c_attr)
+        parsed_fill_c_check = parse_color(raw_fill_c if raw_fill_c is not None else ('black' if not style_props_c.get('stroke',circle_element.get('stroke')) else 'none')) # Circle default fill black
+        is_gradient_fill = isinstance(parsed_fill_c_check, str) and parsed_fill_c_check in all_gradients
+        if is_gradient_fill and not style_props_c.get('stroke', circle_element.get('stroke')): # If gradient and no separate stroke, skip (handled by draw_circles_with_gradients)
+            continue
+        raw_stroke_c = style_props_c.get('stroke', circle_element.get('stroke'))
+        raw_stroke_width_c = style_props_c.get('stroke-width', circle_element.get('stroke-width','1'))
+        raw_fill_opacity_c = style_props_c.get('fill-opacity', circle_element.get('fill-opacity'))
+        raw_stroke_opacity_c = style_props_c.get('stroke-opacity', circle_element.get('stroke-opacity'))
+        stroke_c_val = parse_color(raw_stroke_c if raw_stroke_c is not None else 'none')
+        try:
+            sw_c = float(str(raw_stroke_width_c).replace('px','')) if raw_stroke_width_c else 1.0
+        except ValueError: sw_c = 1.0
+        final_fill_c = None
+        if not is_gradient_fill and parsed_fill_c_check and isinstance(parsed_fill_c_check, tuple): # Only if not gradient and fill is a color
+            alpha_f_c = 1.0
+            if raw_fill_opacity_c:
+                try: alpha_f_c = float(raw_fill_opacity_c)
+                except ValueError: pass
+            final_fill_c = parsed_fill_c_check + (alpha_f_c,) if len(parsed_fill_c_check) == 3 else (parsed_fill_c_check[0],parsed_fill_c_check[1],parsed_fill_c_check[2],min(parsed_fill_c_check[3], alpha_f_c) if len(parsed_fill_c_check) == 4 else alpha_f_c)
+        final_stroke_c = None
+        if stroke_c_val and isinstance(stroke_c_val, tuple):
+            alpha_s_c = 1.0
+            if raw_stroke_opacity_c:
+                try: alpha_s_c = float(raw_stroke_opacity_c)
+                except ValueError: pass
+            final_stroke_c = stroke_c_val + (alpha_s_c,) if len(stroke_c_val) == 3 else (stroke_c_val[0],stroke_c_val[1],stroke_c_val[2],min(stroke_c_val[3], alpha_s_c) if len(stroke_c_val) == 4 else alpha_s_c)
+        cx_c = float(circle_element.get('cx', '0')); cy_c = float(circle_element.get('cy', '0')); r_c = float(circle_element.get('r', '0'))
+        draw_circle(c, cx_c, cy_c, r_c, final_stroke_c, final_fill_c if not is_gradient_fill else None, sw_c)
+    for rect_element in root.findall('.//svg:rect', ns):
+        style_props_rect = _parse_inline_style(rect_element.get('style', ''))
+        raw_fill_rect = style_props_rect.get('fill', rect_element.get('fill'))
+        raw_stroke_rect = style_props_rect.get('stroke', rect_element.get('stroke'))
+        raw_stroke_width_rect = style_props_rect.get('stroke-width', rect_element.get('stroke-width','1'))
+        raw_fill_opacity_rect = style_props_rect.get('fill-opacity', rect_element.get('fill-opacity'))
+        raw_stroke_opacity_rect = style_props_rect.get('stroke-opacity', rect_element.get('stroke-opacity'))
+        raw_opacity_rect = style_props_rect.get('opacity', rect_element.get('opacity'))
+        fill_r_val = parse_color(raw_fill_rect if raw_fill_rect is not None else 'none') # Rect default fill is none
+        stroke_r_val = parse_color(raw_stroke_rect if raw_stroke_rect is not None else 'none')
+        try:
+            sw_r = float(str(raw_stroke_width_rect).replace('px','')) if raw_stroke_width_rect else 1.0
+        except ValueError: sw_r = 1.0
+        final_fill_r = None
+        if fill_r_val and isinstance(fill_r_val, tuple):
+            alpha_r = 1.0
+            if raw_fill_opacity_rect:
+                try: alpha_r = float(raw_fill_opacity_rect)
+                except ValueError: pass
+            elif raw_opacity_rect:
+                try: alpha_r = float(raw_opacity_rect) # General opacity
+                except ValueError: pass
+            final_fill_r = fill_r_val + (alpha_r,) if len(fill_r_val) == 3 else (fill_r_val[0],fill_r_val[1],fill_r_val[2],min(fill_r_val[3],alpha_r) if len(fill_r_val)==4 else alpha_r)
+        elif isinstance(fill_r_val, str) and fill_r_val in all_gradients: final_fill_r = fill_r_val # Pass ID
+        final_stroke_r = None
+        if stroke_r_val and isinstance(stroke_r_val, tuple):
+            alpha_sr = 1.0
+            if raw_stroke_opacity_rect:
+                try: alpha_sr = float(raw_stroke_opacity_rect)
+                except ValueError: pass
+            elif raw_opacity_rect:
+                try: alpha_sr = float(raw_opacity_rect)
+                except ValueError: pass
+            final_stroke_r = stroke_r_val + (alpha_sr,) if len(stroke_r_val) == 3 else (stroke_r_val[0],stroke_r_val[1],stroke_r_val[2],min(stroke_r_val[3],alpha_sr)if len(stroke_r_val)==4 else alpha_sr)
+        x_r = float(rect_element.get('x', '0')); y_r = float(rect_element.get('y', '0'))
+        w_r = float(rect_element.get('width', '0')); h_r = float(rect_element.get('height', '0'))
+        if isinstance(final_fill_r, str) and final_fill_r in all_gradients:
+             grad_r_data = all_gradients[final_fill_r]
+             fill_color_for_rect_from_grad = None
+             if grad_r_data.get('stops'): fill_color_for_rect_from_grad = grad_r_data['stops'][0][1][:3]
+             draw_rect(c, x_r, y_r, w_r, h_r, final_stroke_r, fill_color_for_rect_from_grad, sw_r)
+        else:
+             draw_rect(c, x_r, y_r, w_r, h_r, final_stroke_r, final_fill_r, sw_r)
+    for ellipse_element in root.findall('.//svg:ellipse', ns):
+        style_props_ellipse = _parse_inline_style(ellipse_element.get('style', ''))
+        raw_fill_e = style_props_ellipse.get('fill', ellipse_element.get('fill'))
+        raw_stroke_e = style_props_ellipse.get('stroke', ellipse_element.get('stroke'))
+        raw_stroke_width_e = style_props_ellipse.get('stroke-width', ellipse_element.get('stroke-width','1'))
+        raw_fill_opacity_e = style_props_ellipse.get('fill-opacity', ellipse_element.get('fill-opacity'))
+        raw_stroke_opacity_e = style_props_ellipse.get('stroke-opacity', ellipse_element.get('stroke-opacity'))
+        fill_e_val = parse_color(raw_fill_e if raw_fill_e is not None else 'black')
+        stroke_e_val = parse_color(raw_stroke_e if raw_stroke_e is not None else 'none')
+        try:
+            sw_e = float(str(raw_stroke_width_e).replace('px','')) if raw_stroke_width_e else 1.0
+        except ValueError: sw_e = 1.0
+        final_fill_e = None
+        if fill_e_val and isinstance(fill_e_val, tuple):
+            alpha_f_e = 1.0
+            if raw_fill_opacity_e:
+                try: alpha_f_e = float(raw_fill_opacity_e)
+                except ValueError: pass
+            final_fill_e = fill_e_val + (alpha_f_e,) if len(fill_e_val) == 3 else (fill_e_val[0],fill_e_val[1],fill_e_val[2],min(fill_e_val[3],alpha_f_e) if len(fill_e_val)==4 else alpha_f_e)
+        elif isinstance(fill_e_val, str) and fill_e_val in all_gradients: final_fill_e = fill_e_val
+        final_stroke_e = None
+        if stroke_e_val and isinstance(stroke_e_val, tuple):
+            alpha_s_e = 1.0
+            if raw_stroke_opacity_e:
+                try: alpha_s_e = float(raw_stroke_opacity_e)
+                except ValueError: pass
+            final_stroke_e = stroke_e_val + (alpha_s_e,) if len(stroke_e_val) == 3 else (stroke_e_val[0],stroke_e_val[1],stroke_e_val[2],min(stroke_e_val[3],alpha_s_e) if len(stroke_e_val)==4 else alpha_s_e)
+        cx_e = float(ellipse_element.get('cx', '0')); cy_e = float(ellipse_element.get('cy', '0'))
+        rx_e = float(ellipse_element.get('rx', '0')); ry_e = float(ellipse_element.get('ry', '0'))
+        if isinstance(final_fill_e, str) and final_fill_e in all_gradients:
+             grad_e_data = all_gradients[final_fill_e]
+             fill_color_for_ellipse = None
+             if grad_e_data.get('stops'): fill_color_for_ellipse = grad_e_data['stops'][0][1][:3]
+             draw_ellipse(c, cx_e, cy_e, rx_e, ry_e, final_stroke_e, fill_color_for_ellipse, sw_e)
+        else:
+             draw_ellipse(c, cx_e, cy_e, rx_e, ry_e, final_stroke_e, final_fill_e, sw_e)
+    for path_element in root.findall('.//svg:path', ns):
+        is_in_defs_p = any(path_element in list(defs_el_iter) for defs_el_iter in root.findall('.//svg:defs', ns))
+        if is_in_defs_p: continue
+        path_id_p = path_element.get('id', '')
+        if path_id_p in connection_path_ids: continue
+        path_data_p = path_element.get('d', '')
+        if not path_data_p: continue
+        style_props_p = _parse_inline_style(path_element.get('style', ''))
+        raw_fill_p = style_props_p.get('fill', path_element.get('fill'))
+        raw_stroke_p = style_props_p.get('stroke', path_element.get('stroke'))
+        raw_stroke_width_p = style_props_p.get('stroke-width', path_element.get('stroke-width', '1'))
+        raw_fill_opacity_p = style_props_p.get('fill-opacity', path_element.get('fill-opacity'))
+        raw_stroke_opacity_p = style_props_p.get('stroke-opacity', path_element.get('stroke-opacity'))
+        fill_val_p = parse_color(raw_fill_p if raw_fill_p is not None else ('black' if not raw_stroke_p and not style_props_p.get('stroke') else 'none'))
+        stroke_val_p = parse_color(raw_stroke_p if raw_stroke_p is not None else 'none')
+        try:
+            sw_p = float(str(raw_stroke_width_p).replace('px','')) if raw_stroke_width_p else 1.0
+        except ValueError: sw_p = 1.0
+        final_fill_p = None
+        if fill_val_p and isinstance(fill_val_p, tuple):
+            alpha_f = 1.0
+            if raw_fill_opacity_p:
+                try: alpha_f = float(raw_fill_opacity_p)
+                except ValueError: pass
+            final_fill_p = fill_val_p + (alpha_f,) if len(fill_val_p) == 3 else (fill_val_p[0],fill_val_p[1],fill_val_p[2],min(fill_val_p[3],alpha_f) if len(fill_val_p)==4 else alpha_f)
+        elif isinstance(fill_val_p, str) and fill_val_p in all_gradients: final_fill_p = fill_val_p
+        final_stroke_p = None
+        if stroke_val_p and isinstance(stroke_val_p, tuple):
+            alpha_s = 1.0
+            if raw_stroke_opacity_p:
+                try: alpha_s = float(raw_stroke_opacity_p)
+                except ValueError: pass
+            final_stroke_p = stroke_val_p + (alpha_s,) if len(stroke_val_p) == 3 else (stroke_val_p[0],stroke_val_p[1],stroke_val_p[2],min(stroke_val_p[3],alpha_s) if len(stroke_val_p)==4 else alpha_s)
+        path_commands_p = parse_path(path_data_p)
+        if isinstance(final_fill_p, str) and final_fill_p in all_gradients:
+            grad_p = all_gradients[final_fill_p]
+            temp_fill_color = None
+            if grad_p.get('stops'):
+                first_stop_p = grad_p['stops'][0][1]
+                temp_fill_color = first_stop_p[:3] + (first_stop_p[3] if len(first_stop_p)>3 else 1.0,)
+            draw_path(c, path_commands_p, final_stroke_p, temp_fill_color, sw_p)
+        else:
+            draw_path(c, path_commands_p, final_stroke_p, final_fill_p, sw_p)
+    process_text_elements(c, root, all_paths, ns, font_to_use)
+    return c
 
 
 def convert_chem_to_file(svg_data: str, file_path: Union[str, Path, None] = None, return_bytes: bool = False):
-    """
-    Convert a chemical 2D depiction SVG into a .pdf/.png using custom parser.
-    If return_bytes is True, returns the file contents as bytes.
-    Otherwise, saves to file_path.
-    """
-    output_ext = 'png' # Default if file_path is None (implies return_bytes for PNG)
-    if file_path:
-        output_ext = str(file_path).lower().split('.')[-1]
-    # Determine the target for the PDF canvas
-    # This can be a file path or a BytesIO buffer.
-    pdf_canvas_target: Union[str, Path, BytesIO]
-    temp_pdf_for_png_path: Union[str, None] = None # Path if PNG needs temp PDF file
-    if output_ext == 'pdf':
-        if return_bytes:
-            pdf_canvas_target = BytesIO()
-        else: # PDF to file
-            if file_path is None: raise ValueError("file_path must be provided for PDF output if not returning bytes.")
-            pdf_canvas_target = file_path
-    else: # PNG output
-        # PNG generation always needs an intermediate PDF.
-        # If returning bytes, use BytesIO for PDF if fitz can open it, else temp file.
-        # Fitz typically needs a filename or bytes, not a BytesIO stream object directly for open().
-        # So, always create a temporary PDF file for PNG generation.
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_f:
-            temp_pdf_for_png_path = tmp_f.name
-        pdf_canvas_target = temp_pdf_for_png_path
-    # Render SVG to PDF canvas (alt_text_info=None for chem)
-    canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_canvas_target, alt_text_info=None)
-    canvas_obj.save() # Save the canvas to the target (file or BytesIO buffer)
-    if output_ext == 'pdf':
-        if return_bytes:
-            # pdf_canvas_target is BytesIO, get its value
-            pdf_data = pdf_canvas_target.getvalue() # type: ignore 
-            pdf_canvas_target.close() # type: ignore
-            return pdf_data
-        else:
-            # PDF was written to file_path directly.
-            return None # Function returns None when saving to file
-    # output_ext == 'png'
-    # Intermediate PDF was saved to temp_pdf_for_png_path
-    if temp_pdf_for_png_path is None: # Should not happen due to logic above
-        raise Exception("Internal error: temp PDF path for PNG not set.")
-    doc = fitz.open(temp_pdf_for_png_path)
-    page = doc.load_page(0)
-    pix = page.get_pixmap(dpi=300) # Maintain original DPI for chem PNGs
-    png_result_data: Union[bytes, None] = None
+  if isinstance(svg_data, bytes):
+    svg_data = svg_data.decode('utf-8')
+  ext = 'png' if file_path is None else str(file_path).lower().split('.')[-1]
+  pdf_canvas_target: Union[str, Path, BytesIO]
+  temp_pdf_path: Union[str, None] = None
+  if ext == 'png':
+    if not FITZ_AVAILABLE:
+        warnings.warn("PyMuPDF (fitz) is not installed. PNG generation for 'chem' mode is not available.")
+        return None
+    _intermediate_temp_pdf_file = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+    temp_pdf_path = _intermediate_temp_pdf_file.name
+    _intermediate_temp_pdf_file.close()
+    pdf_canvas_target = temp_pdf_path
+  elif ext == 'pdf':
     if return_bytes:
-        png_result_data = pix.tobytes("png")
-    else: # Save to file
-        if file_path is None: raise ValueError("file_path must be provided for PNG output if not returning bytes.")
-        pix.save(str(file_path))
-    doc.close()
-    os.unlink(temp_pdf_for_png_path) # Clean up temporary PDF file
-    return png_result_data if return_bytes else None
+      pdf_canvas_target = BytesIO()
+    else:
+      if file_path is None:
+          raise ValueError("file_path must be provided for PDF output if not returning bytes.")
+      pdf_canvas_target = file_path # type: ignore
+  else:
+      raise ValueError(f"Unsupported extension: {ext}")
+  canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_canvas_target, alt_text_info=None)
+  canvas_obj.save()
+  if ext == 'pdf':
+    if return_bytes:
+      pdf_data = pdf_canvas_target.getvalue() # type: ignore
+      pdf_canvas_target.close() # type: ignore
+      return pdf_data
+    else:
+      return None
+  else: # ext == 'png'
+    if temp_pdf_path is None:
+        raise Exception("Internal error: temp PDF path for PNG (chem) not set.")
+    doc = fitz.open(temp_pdf_path)
+    page = doc.load_page(0)
+    pix = page.get_pixmap(dpi=300)
+    if return_bytes:
+      png_bytes = pix.tobytes("png")
+      doc.close()
+      os.unlink(temp_pdf_path)
+      return png_bytes
+    else: # save to file
+      if file_path is None:
+          doc.close()
+          os.unlink(temp_pdf_path)
+          raise ValueError("file_path must be provided for PNG output if not returning bytes.")
+      pix.save(str(file_path))
+      doc.close()
+      os.unlink(temp_pdf_path)
+      return None
 
-
+    
 def convert_svg_to_pdf(svg_data: str, pdf_file_path: Union[str, Path], return_canvas: bool = False, chem: bool = False):
-  """Convert SVG to PDF with text path support."""
   if chem:
-    # Delegate to convert_chem_to_file, ensuring it saves to pdf_file_path
+    if isinstance(svg_data, bytes):
+        svg_data = svg_data.decode('utf-8')
     convert_chem_to_file(svg_data, file_path=pdf_file_path, return_bytes=False)
     return None
-  # Non-chem path:
-  # _render_svg_to_pdf_canvas will extract aria-label itself if alt_text_info is not passed.
-  canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_file_path) 
+  if isinstance(svg_data, bytes):
+    svg_data = svg_data.decode('utf-8')
+  alt_text_payload = None
+  aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
+  if aria_label_match:
+    alt_text_payload = {'alt_text': aria_label_match.group(1)}
+  canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_file_path, alt_text_info=alt_text_payload)
   if return_canvas:
-    # Caller is responsible for saving the canvas.
     return canvas_obj
   else:
     canvas_obj.save()
     return None
 
 
-def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = None, 
-                       output_width: Union[int, None] = None, output_height: Union[int, None] = None, 
+def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = None,
+                       output_width: Union[int, None] = None, output_height: Union[int, None] = None,
                        scale: Union[float, None] = None, return_bytes: bool = False,
                        chem: bool = False):
-  """Convert SVG to PNG with pymupdf, with support for scaling and dimensions."""
   if chem:
+    if isinstance(svg_data, bytes):
+        svg_data = svg_data.decode('utf-8')
     return convert_chem_to_file(svg_data, file_path=png_file_path, return_bytes=return_bytes)
-  # Non-chem path:
+  if not FITZ_AVAILABLE:
+    warnings.warn(
+        "PyMuPDF (fitz) is not installed. PNG generation is not available. "
+        "Please install PyMuPDF (`pip install PyMuPDF`) to enable PNG export."
+    )
+    if return_bytes: return None
+    else: return None
   if not return_bytes and png_file_path is None:
       raise ValueError("png_file_path must be provided if return_bytes is False.")
-  # Extract ALT text from SVG for PDF metadata and PNG metadata
+  if isinstance(svg_data, bytes):
+    svg_data = svg_data.decode('utf-8')
   aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
   alt_text = aria_label_match.group(1) if aria_label_match else None
-  alt_text_payload = {'alt_text': alt_text} if alt_text else None
-  # Determine path for intermediate PDF
-  temp_pdf_for_conversion: str
-  if png_file_path: # If final PNG path is known, derive temp PDF name
-      temp_pdf_for_conversion = f"{os.path.splitext(str(png_file_path))[0]}.pdf"
-  else: # Final PNG path not known (must be return_bytes=True), use tempfile name
-      with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-          temp_pdf_for_conversion = tmp.name
-  # Generate the intermediate PDF using the core rendering logic
-  canvas_obj = _render_svg_to_pdf_canvas(svg_data, temp_pdf_for_conversion, alt_text_info=alt_text_payload)
-  canvas_obj.save()
-  # Convert PDF to PNG using fitz
-  doc = fitz.open(temp_pdf_for_conversion)
+  alt_text_payload_for_pdf = {'alt_text': alt_text} if alt_text else None
+  temp_pdf_path_local: str
+  if png_file_path is None and return_bytes is True:
+    _temp_pdf_obj_bytes = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+    temp_pdf_path_local = _temp_pdf_obj_bytes.name
+    _temp_pdf_obj_bytes.close()
+  elif png_file_path is not None:
+    _temp_pdf_obj_file = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+    temp_pdf_path_local = _temp_pdf_obj_file.name
+    _temp_pdf_obj_file.close()
+  else: # Should not happen given the initial check
+    raise ValueError("Invalid state for png_file_path and return_bytes")
+  canvas_object = _render_svg_to_pdf_canvas(svg_data, temp_pdf_path_local, alt_text_info=alt_text_payload_for_pdf)
+  canvas_object.save()
+  doc = fitz.open(temp_pdf_path_local)
   page = doc[0]
-  # Refined scaling logic
   page_rect = page.rect
-  page_width = page_rect.width if page_rect.width > 0.001 else 1.0
-  page_height = page_rect.height if page_rect.height > 0.001 else 1.0
+  page_width = page_rect.width if page_rect.width > 1e-3 else 1.0
+  page_height = page_rect.height if page_rect.height > 1e-3 else 1.0
   zoom_x, zoom_y = 1.0, 1.0
   if scale is not None:
       zoom_x = zoom_y = scale
@@ -950,23 +1220,26 @@ def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = No
       zoom_x = zoom_y = output_height / page_height
   zoom_matrix = fitz.Matrix(zoom_x, zoom_y)
   pix = page.get_pixmap(matrix=zoom_matrix)
-  png_data_bytes: Union[bytes, None] = None
   if return_bytes:
-      png_data_bytes = pix.tobytes("png")
-  else: # Save to file (png_file_path is guaranteed to be not None here)
-      pix.save(str(png_file_path))
-  doc.close()
-  os.remove(temp_pdf_for_conversion) # Clean up intermediate PDF
-  if return_bytes:
-      return png_data_bytes
-  else: # Saved to file, now add ALT text metadata to PNG
-      if alt_text and png_file_path:
-          try:
-              img = Image.open(str(png_file_path))
-              img.load() 
-              metadata = PngImagePlugin.PngInfo()
-              metadata.add_text("alt", alt_text) # Using "alt" as key, common for accessibility.
-              img.save(str(png_file_path), pnginfo=metadata)
-          except Exception:
-              pass # Silently ignore if metadata addition fails
-      return None
+    png_data_bytes = pix.tobytes("png")
+    doc.close()
+    os.unlink(temp_pdf_path_local)
+    return png_data_bytes
+  else: # Save to file
+    if png_file_path is None: # Already checked, but for safety
+        doc.close()
+        os.unlink(temp_pdf_path_local)
+        raise ValueError("png_file_path is required for PNG file output.")
+    pix.save(str(png_file_path))
+    doc.close()
+    os.unlink(temp_pdf_path_local)
+    if alt_text and png_file_path:
+        try:
+            img = Image.open(str(png_file_path))
+            img.load()
+            metadata = PngImagePlugin.PngInfo()
+            metadata.add_text("alt", alt_text)
+            img.save(str(png_file_path), pnginfo=metadata)
+        except Exception:
+            pass
+    return None

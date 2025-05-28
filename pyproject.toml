@@ -21,7 +21,6 @@ classifiers = [
 keywords = ["svg", "pdf", "renderer", "glycans", "chemistry", "glycodraw"]
 dependencies = [
     "reportlab>=3.6.0",
-    "pymupdf>=1.19.0",
     "Pillow"
 ]
 requires-python = ">=3.9"
@@ -29,6 +28,9 @@ requires-python = ">=3.9"
 [project.urls]
 "Homepage" = "https://github.com/BojarLab/glycorender"
 "Bug Tracker" = "https://github.com/BojarLab/glycorender/issues"
+
+[project.optional-dependencies]
+png = ["pymupdf>=1.19.0"]
 
 [tool.setuptools]
 packages = ["glycorender"]
