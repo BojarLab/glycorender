@@ -707,14 +707,48 @@ def draw_circles_with_gradients(c, root, all_gradients, ns):
                                 lambda canvas, center_x, center_y, radius: canvas.circle(center_x, center_y, radius, fill=1, stroke=0))
 
 
-def draw_connection_paths(c, connection_path_ids, all_paths):
+def draw_connection_paths(c, connection_path_ids, all_paths, root=None, ns=None):
   """Draw connection paths between elements."""
   c.setLineCap(1)  # Set round cap for all connection lines
   for path_id in connection_path_ids:
     path_info = all_paths[path_id]
-    # Slightly extend connection paths to ensure overlap
-    commands = path_info['commands']
+    commands = path_info['commands'][:]  # Copy to avoid modifying original
+    # Check if this path ends at an invisible circle and shorten if needed
+    if root is not None and ns is not None and commands:
+      commands = shorten_if_invisible_endpoint(commands, root, ns)
     draw_path(c, commands, path_info['stroke'], None, path_info['stroke_width'])
+
+def shorten_if_invisible_endpoint(commands, root, ns):
+  """Shorten connection path if it ends at an invisible circle."""
+  if len(commands) < 2:
+    return commands
+  # Get endpoint from last command
+  last_cmd, last_params = commands[-1]
+  if last_cmd != 'L' or len(last_params) < 2:
+    return commands
+  end_x, end_y = last_params[0], last_params[1]
+  # Check for invisible circle at endpoint
+  for circle in root.findall('.//svg:circle', ns):
+    cx = float(circle.get('cx', '0'))
+    cy = float(circle.get('cy', '0'))
+    if abs(cx - end_x) < 1 and abs(cy - end_y) < 1:  # Same position
+      fill = circle.get('fill', '')
+      stroke = circle.get('stroke', '')
+      if fill == 'none' and (stroke == 'none' or stroke == ''):
+        # Invisible circle found, shorten the path
+        first_cmd, first_params = commands[0]
+        if first_cmd == 'M' and len(first_params) >= 2:
+          start_x, start_y = first_params[0], first_params[1]
+          dx = end_x - start_x
+          dy = end_y - start_y
+          length = math.sqrt(dx*dx + dy*dy)
+          if length > 25:  # Shorten by 25 units
+            factor = (length - 25) / length
+            new_end_x = start_x + dx * factor
+            new_end_y = start_y + dy * factor
+            commands[-1] = (last_cmd, [new_end_x, new_end_y])
+        break
+  return commands
 
 
 def draw_circle_shapes(c, root, all_gradients, ns):
@@ -935,7 +969,7 @@ def _render_svg_to_pdf_canvas(svg_data: str,
                 c.rotate(90)
                 c.translate(-pivot_x, -pivot_y)
     draw_circles_with_gradients(c, root, all_gradients, ns)
-    draw_connection_paths(c, connection_path_ids, all_paths)
+    draw_connection_paths(c, connection_path_ids, all_paths, root, ns)
     for circle_element in root.findall('.//svg:circle', ns):
         style_props_c = _parse_inline_style(circle_element.get('style', ''))
         raw_fill_c_attr = circle_element.get('fill')
