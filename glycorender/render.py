@@ -1052,6 +1052,7 @@ def _render_svg_to_pdf_canvas(svg_data: str,
         if is_in_defs_p: continue
         path_id_p = path_element.get('id', '')
         if path_id_p in connection_path_ids: continue
+        if path_element.get('stroke-width') == '4.0': continue
         path_data_p = path_element.get('d', '')
         if not path_data_p: continue
         style_props_p = _parse_inline_style(path_element.get('style', ''))
