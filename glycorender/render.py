@@ -304,6 +304,7 @@ def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1):
 def draw_rect(c, x, y, width, height, stroke_color=None, fill_color=None, stroke_width=1):
   """Draw rectangle on canvas."""
   c.saveState()
+  c.setLineJoin(1)
   if stroke_color and isinstance(stroke_color, tuple):
     c.setStrokeColorRGB(*stroke_color)
     c.setLineWidth(stroke_width)
