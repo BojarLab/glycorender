@@ -1279,3 +1279,19 @@ def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = No
         except Exception:
             pass
     return None
+
+
+def pdf_to_svg_bytes(svg_string):
+  """Convert SVG → glycorender PDF → SVG for display in browser"""
+  with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False) as temp_pdf:
+    temp_pdf_path = temp_pdf.name
+  try:
+    convert_svg_to_pdf(svg_string, temp_pdf_path)
+    doc = fitz.open(temp_pdf_path)
+    page = doc[0]
+    svg_output = page.get_svg_image()
+    doc.close()
+    return svg_output
+  finally:
+    if os.path.exists(temp_pdf_path):
+      os.unlink(temp_pdf_path)
