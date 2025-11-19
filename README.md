@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="glycorender_logo.png" alt="glycorender Logo" width="400"/>
+</p>
+
 # glycorender
 
 A bespoke SVG to PDF/PNG renderer for the GlycoDraw platform, specialized in accurately rendering glycan structures with support for chemical notations and path-based text positioning.
