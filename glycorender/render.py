@@ -1295,3 +1295,33 @@ def pdf_to_svg_bytes(svg_string):
   finally:
     if os.path.exists(temp_pdf_path):
       os.unlink(temp_pdf_path)
+
+
+def simple_svg_to_pdf(svg_data: str, pdf_path: Union[str, Path]) -> None:
+  """Convert composite SVG to PDF without additional glycan-specific rendering."""
+  if not FITZ_AVAILABLE:
+    raise ImportError("PyMuPDF (fitz) is required for PDF conversion")
+  if isinstance(svg_data, bytes):
+    svg_data = svg_data.decode('utf-8')
+  doc = fitz.open("svg", svg_data.encode())
+  page = doc.load_page(0)
+  pix = page.get_pixmap(dpi = 300)
+  pdf_doc = fitz.open()
+  pdf_page = pdf_doc.new_page(width = pix.width, height = pix.height)
+  pdf_page.insert_image(pdf_page.rect, pixmap = pix)
+  pdf_doc.save(str(pdf_path))
+  pdf_doc.close()
+  doc.close()
+
+
+def simple_svg_to_png(svg_data: str, png_path: Union[str, Path]) -> None:
+  """Convert composite SVG to PNG without additional glycan-specific rendering."""
+  if not FITZ_AVAILABLE:
+    raise ImportError("PyMuPDF (fitz) is required for PNG conversion")
+  if isinstance(svg_data, bytes):
+    svg_data = svg_data.decode('utf-8')
+  doc = fitz.open("svg", svg_data.encode())
+  page = doc.load_page(0)
+  pix = page.get_pixmap(dpi = 300)
+  pix.save(str(png_path))
+  doc.close()
