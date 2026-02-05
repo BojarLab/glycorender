@@ -1303,15 +1303,12 @@ def simple_svg_to_pdf(svg_data: str, pdf_path: Union[str, Path]) -> None:
     raise ImportError("PyMuPDF (fitz) is required for PDF conversion")
   if isinstance(svg_data, bytes):
     svg_data = svg_data.decode('utf-8')
-  doc = fitz.open("svg", svg_data.encode())
-  page = doc.load_page(0)
-  pix = page.get_pixmap(dpi = 300)
-  pdf_doc = fitz.open()
-  pdf_page = pdf_doc.new_page(width = pix.width, height = pix.height)
-  pdf_page.insert_image(pdf_page.rect, pixmap = pix)
+  svg_doc = fitz.open("svg", svg_data.encode())
+  pdf_bytes = svg_doc.convert_to_pdf()
+  pdf_doc = fitz.open("pdf", pdf_bytes)
   pdf_doc.save(str(pdf_path))
   pdf_doc.close()
-  doc.close()
+  svg_doc.close()
 
 
 def simple_svg_to_png(svg_data: str, png_path: Union[str, Path]) -> None:
