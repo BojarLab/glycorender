@@ -83,9 +83,7 @@ Parameters:
 
 ## Dependencies
 
-- ReportLab: For PDF generation
-- PyMuPDF: For PNG conversion
-- Pillow: For PNG metadata injection
+- PyMuPDF (optional): For PNG conversion
 
 ## Contributing
 
