@@ -1,3 +1,7 @@
 from .render import *
 
-__version__ = "0.1.0"
+from importlib.metadata import version, PackageNotFoundError
+try:
+    __version__ = version("glycorender")
+except PackageNotFoundError:  # running from a source checkout that was never pip-installed
+    __version__ = "0.0.0+local"
