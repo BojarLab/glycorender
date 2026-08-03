@@ -110,6 +110,8 @@ class Canvas:
         self.buf.append('%d J' % mode)
     def setLineJoin(self, mode):
         self.buf.append('%d j' % mode)
+    def setDash(self, pattern=None, phase=0):
+        self.buf.append('[%s] %s d' % (' '.join(_fmt(v) for v in (pattern or [])), _fmt(phase)))
     # --- transforms ---
     def transform(self, a, b, c, d, e, f):
         self.buf.append('%s %s %s %s %s %s cm' % tuple(_fmt(v) for v in (a, b, c, d, e, f)))

@@ -115,7 +115,7 @@ def point_at_length(points, target_length):
     return (x2, y2, angle)
 
 
-def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1):
+def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1, dash=None):
     """Draw path on canvas."""
     if not commands:
         return
@@ -123,6 +123,8 @@ def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1):
     if stroke_color and isinstance(stroke_color, tuple):
         c.setStrokeColorRGB(*stroke_color)
         c.setLineWidth(stroke_width)
+        if dash:
+            c.setDash(dash)
     if fill_color and isinstance(fill_color, tuple):
         if len(fill_color) == 3:
             c.setFillColorRGB(*fill_color)
@@ -277,9 +279,10 @@ def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1):
                 path.close()
                 if start_x is not None: curr_x, curr_y = start_x, start_y
             last_cmd_processed = cmd
-        if first_x is not None and (last_cmd_processed != 'Z' and last_cmd_processed != 'z') and \
+        if first_x is not None and not dash and (last_cmd_processed != 'Z' and last_cmd_processed != 'z') and \
                 sum(1 for cmd, _ in commands if cmd in ('M', 'm')) == 1 and \
-                (abs(curr_x - first_x) > 1e-3 or abs(curr_y - first_y) > 1e-3):  # Added tolerance for float comparison
+                (abs(curr_x - first_x) > 1e-3 or abs(
+                    curr_y - first_y) > 1e-3):  # Added tolerance for float comparison; a dashed open path must not be retraced, or the return stroke fills its own gaps
             path.lineTo(first_x, first_y)
             path.close()
     if fill_color and isinstance(fill_color, tuple):
@@ -542,6 +545,17 @@ def _resolve_paint(elem, default_fill = 'auto', default_width = 1.0, use_opacity
     return final_fill, final_stroke, width
 
 
+def _resolve_dash(elem):
+    """Resolve stroke-dasharray of an SVG element into a dash pattern, honoring inline style."""
+    raw = _parse_inline_style(elem.get('style', '')).get('stroke-dasharray', elem.get('stroke-dasharray'))
+    if not raw or raw.strip() in ('none', ''):
+        return None
+    try:
+        return [float(v) for v in re.split(r'[,\s]+', raw.strip()) if v]
+    except ValueError:
+        return None
+
+
 def extract_defs(root, ns):
     all_paths = {}
     all_gradients = {}
@@ -554,7 +568,7 @@ def extract_defs(root, ns):
             path_commands = parse_path(path.get('d', ''))
             path_points = calculate_points(path_commands)
             all_paths[path_id] = {
-                'points': path_points, 'commands': path_commands,
+                'points': path_points, 'commands': path_commands, 'dash': _resolve_dash(path),
                 'stroke': final_stroke, 'fill': final_fill, 'stroke_width': stroke_width_val
             }
         for radial_gradient in defs.findall('.//svg:radialGradient', ns):
@@ -594,7 +608,7 @@ def extract_defs(root, ns):
             path_commands = parse_path(path.get('d', ''))
             path_points = calculate_points(path_commands)
             all_paths[path_id] = {
-                'points': path_points, 'commands': path_commands, 'is_connection': True,
+                'points': path_points, 'commands': path_commands, 'is_connection': True, 'dash': _resolve_dash(path),
                 'stroke': final_stroke_conn, 'fill': final_fill_conn, 'stroke_width': stroke_width_val_conn
             }
     return all_paths, all_gradients
@@ -666,7 +680,7 @@ def draw_connection_paths(c, connection_path_ids, all_paths, root=None, ns=None)
         # Check if this path ends at an invisible circle and shorten if needed
         if root is not None and ns is not None and commands:
             commands = shorten_if_invisible_endpoint(commands, root, ns)
-        draw_path(c, commands, path_info['stroke'], None, path_info['stroke_width'])
+        draw_path(c, commands, path_info['stroke'], None, path_info['stroke_width'], dash = path_info.get('dash'))
 
 def shorten_if_invisible_endpoint(commands, root, ns):
     """Shorten connection path if it ends at an invisible circle."""
