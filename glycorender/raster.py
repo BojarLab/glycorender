@@ -210,7 +210,7 @@ def stroke_polys(subs, width, cap, join, dash = None, phase = 0.0):
                         ml = math.hypot(mx, my)
                         if ml > 1e-9:
                             d = hw / math.sin(half)
-                            wedge = [(cx, cy), a, (cx - mx / ml * d, cy - my / ml * d), b]
+                            wedge = [(cx, cy), a, (cx + mx / ml * d, cy + my / ml * d), b]
                 polys.append(_norm(wedge))
             if cap == 1 and not closed:
                 polys.append(_arc(run[0][0], run[0][1], hw))

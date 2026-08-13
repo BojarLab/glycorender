@@ -304,10 +304,10 @@ class Canvas:
             buf.append('q')
             cur = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
             for box, ctm in op.get('clip') or ():
-                buf.append('%s %s %s %s %s %s cm' % tuple(_fmt(v) for v in _mul(_inv(cur), ctm)))
+                buf.append('%s %s %s %s %s %s cm' % tuple(_fmt(v) for v in _mul(ctm, _inv(cur))))
                 buf.append('%s %s %s %s re W n' % tuple(_fmt(v) for v in box))
                 cur = ctm
-            buf.append('%s %s %s %s %s %s cm' % tuple(_fmt(v) for v in _mul(_inv(cur), op['ctm'])))
+            buf.append('%s %s %s %s %s %s cm' % tuple(_fmt(v) for v in _mul(op['ctm'], _inv(cur))))
             if op['kind'] == 'path':
                 grad = op.get('fill_grad')
                 path = [_PDF_OP[seg[0]] % tuple(_fmt(v) for v in seg[1:]) if len(seg) > 1 else _PDF_OP[seg[0]]
@@ -391,14 +391,8 @@ class Canvas:
                         % (name, flags, *[int(v * scale) for v in ttf.bbox], _fmt(ttf.italic_angle),
                            int(ttf.ascent * scale), int(ttf.descent * scale), int(ttf.cap_height * scale),
                            file_ref)).encode())
-        run, start = [], None
-        for gid in range(ttf.num_glyphs):
-            w = int(round(ttf.width(gid)))
-            if start is None:
-                start, run = gid, [w]
-            elif gid == start + len(run):
-                run.append(w)
-        widths = '[%d [%s]]' % (start, ' '.join(str(v) for v in run))
+        kept = sorted(g for g in self.glyphs.get(name, set()) if g < ttf.num_glyphs)
+        widths = '[%s]' % ' '.join('%d [%d]' % (g, int(round(ttf.width(g)))) for g in kept)
         cid = out.add(('<< /Type /Font /Subtype /CIDFontType2 /BaseFont /%s /CIDSystemInfo '
                        '<< /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor %d 0 R '
                        '/DW 1000 /W %s /CIDToGIDMap /Identity >>' % (name, desc, widths)).encode())

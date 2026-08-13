@@ -149,7 +149,7 @@ def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1, d
     if len(commands) == 2:
         cmd1, params1 = commands[0]
         cmd2, params2 = commands[1]
-        if cmd1 == 'M' and cmd2 in ['L', 'V', 'H']:
+        if cmd1 == 'M' and cmd2 in ['L', 'V', 'H'] and len(params1) >= 2:
             if cmd2 == 'V' or (cmd2 == 'L' and len(params2) >= 2 and abs(params1[0] - params2[0]) < 0.1):
                 is_bracket = True
             elif cmd2 == 'H' or (cmd2 == 'L' and len(params2) >= 2 and abs(params1[1] - params2[1]) < 0.1 and abs(params1[0] - params2[0]) < 15):
@@ -473,11 +473,11 @@ def parse_svg_dimensions(root):
     else:
         height = float(re.sub(r'[^\d.]', '', height_raw))
     viewbox = root.get('viewBox', f'0 0 {width} {height}')
-    vbox_parts = [float(x) for x in viewbox.split() if x.strip()]
-    if len(vbox_parts) == 4:
+    vbox_parts = [float(x) for x in re.split(r'[,\s]+', viewbox.strip()) if x]
+    if len(vbox_parts) == 4 and vbox_parts[2] > 0 and vbox_parts[3] > 0:
         vb_x, vb_y, vb_width, vb_height = vbox_parts
     else:
-        vb_x, vb_y, vb_width, vb_height = 0, 0, width, height
+        vb_x, vb_y, vb_width, vb_height = 0, 0, width or 1.0, height or 1.0
     scale_x = width / vb_width
     scale_y = height / vb_height
     return width, height, vb_x, vb_y, scale_x, scale_y
@@ -690,10 +690,10 @@ def draw_circles_with_gradients(c, root, all_gradients, ns, elem_ctm = None):
 
 def draw_connection_paths(c, connection_path_ids, all_paths, root=None, ns=None):
     """Draw connection paths between elements."""
-    c.setLineCap(1)  # Set round cap for all connection lines
-    for path_id in connection_path_ids:
+    for path_id in sorted(connection_path_ids):
         path_info = all_paths[path_id]
         c.saveState()
+        c.setLineCap(1)  # round cap for all connection lines
         c.transform(*path_info.get('ctm', _IDENTITY))
         commands = path_info['commands'][:]  # Copy to avoid modifying original
         # Check if this path ends at an invisible circle and shorten if needed
@@ -745,8 +745,8 @@ def draw_direct_text(c, text, x, y, font_to_use, font_size, fill_color=None, tex
     elif text_anchor == 'end':
         text_width = pdfmetrics.stringWidth(text, font_to_use, font_size)
         x -= text_width
-    if fill_color:
-        c.setFillColorRGB(*fill_color)
+    if isinstance(fill_color, tuple):
+        c.setFillColorRGB(*fill_color[:3])
     # Since we've already flipped the canvas (scale 1, -1), we need to flip back
     # for the text to be right side up
     c.translate(x, y)
@@ -808,7 +808,8 @@ def process_text_elements(c, root, all_paths, ns, font_to_use, elem_ctm = None):
             if start_offset.endswith('%'):
                 offset_percent = float(start_offset[:-1])
             elif start_offset.isdigit():
-                offset_percent = float(start_offset) / path_length(path_points) * 100
+                total = path_length(path_points)
+                offset_percent = float(start_offset) / total * 100 if total else 0.0
             draw_text_on_path(c, text_content, path_points, offset_percent,
                               font_to_use, font_size, fill, text_anchor, offset_y = offset_y, is_bold = is_bold)
         c.restoreState()
