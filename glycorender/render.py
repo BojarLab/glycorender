@@ -1,23 +1,15 @@
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="importlib._bootstrap")
 import xml.etree.ElementTree as ET
-import tempfile
 import re
-import struct
-import zlib
-import os
 import math
 from pathlib import Path
 import glycorender.pdfwrite as canvas
+import glycorender.svgin as svgin
 from glycorender.pdfwrite import pdfmetrics, TTFont
 mm = 72.0 / 25.4
-try:
-    import fitz  # PyMuPDF
-    FITZ_AVAILABLE = True
-except ImportError:
-    FITZ_AVAILABLE = False
 from io import BytesIO
-from typing import Union, Dict
+from typing import Union
 
 reportlab_colors = {
     'darkblue': (0, 0, 0.545),
@@ -39,13 +31,13 @@ def parse_color(color_str):
     if not color_str or color_str == "none":
         return None
     if color_str.startswith('#'):
-        if len(color_str) == 7:  # #RRGGBB
-            if color_str == "#000000":
+        digits = color_str[1:]
+        if len(digits) == 3:
+            digits = ''.join(ch * 2 for ch in digits)
+        if len(digits) == 6:
+            if digits.lower() == '000000':  # nothing in a GlycoDraw figure is ever pure black
                 return reportlab_colors['charcoal']
-            r = int(color_str[1:3], 16) / 255.0
-            g = int(color_str[3:5], 16) / 255.0
-            b = int(color_str[5:7], 16) / 255.0
-            return (r, g, b)
+            return tuple(int(digits[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
     if color_str.startswith('url(#'):
         # Return the gradient ID
         return color_str[5:-1]  # Remove 'url(#' and ')'
@@ -433,52 +425,22 @@ def calculate_points(commands):
     return points
 
 
-def draw_radial_gradient_shape(c, cx, cy, r, stops, shape_func):
-    """Draw a radial gradient with extremely smooth appearance."""
-    # Sort stops by offset
-    stops = sorted(stops, key=lambda x: x[0])
-    # First draw base with innermost color
-    innermost_color = stops[-1][1]
+def _gradient_geometry(grad, bbox):
+    """Gradient center and radius in user space; objectBoundingBox fractions map onto the shape's box."""
+    if grad.get('units', 'objectBoundingBox') == 'userSpaceOnUse':
+        return grad['cx'], grad['cy'], grad['r']
+    x0, y0, x1, y1 = bbox
+    return x0 + (x1 - x0) * grad['cx'], y0 + (y1 - y0) * grad['cy'], grad['r'] * max(x1 - x0, y1 - y0)
+
+
+def draw_radial_gradient_shape(c, cx, cy, r, stops, shape_func, geometry = None):
+    """Fill a shape with a real radial gradient, which every backend resolves natively."""
+    if not stops:
+        return
     c.saveState()
-    c.setFillColorRGB(*innermost_color[:3], alpha=innermost_color[3] * 0.3)
+    c.setFillGradient(*(geometry or (cx, cy, r)), stops)
     shape_func(c, cx, cy, r)
     c.restoreState()
-    # Large number of steps with linear spacing for smooth transition
-    # Adjust based on radius - more circles for bigger radii
-    num_steps = max(30, min(60, int(r * 1.2)))
-    # Store the max offset for proper scaling
-    max_offset = stops[-1][0]
-    # Create circles from largest to smallest
-    for i in range(num_steps):
-        # Linear position in 0-1 range
-        t = i / float(num_steps - 1)
-        # Calculate radius with very small changes between circles
-        # Keep slight spacing at center to avoid overcrowding
-        radius = r * (1.0 - 0.98 * t)
-        # Convert t to gradient position
-        gradient_pos = (1.0 - t) * max_offset
-        # Find segment in gradient this belongs to
-        for j in range(len(stops) - 1):
-            start_offset, start_color = stops[j]
-            end_offset, end_color = stops[j + 1]
-            if start_offset <= gradient_pos <= end_offset:
-                # Calculate position within this segment
-                segment_t = (gradient_pos - start_offset) / (end_offset - start_offset)
-                # Linear color interpolation
-                r_val = start_color[0] + (end_color[0] - start_color[0]) * segment_t
-                g_val = start_color[1] + (end_color[1] - start_color[1]) * segment_t
-                b_val = start_color[2] + (end_color[2] - start_color[2]) * segment_t
-                # Calculate very subtle opacity changes between adjacent circles
-                base_alpha = start_color[3] + (end_color[3] - start_color[3]) * segment_t
-                # Use gentle opacity curve for visually smooth transition
-                opacity = base_alpha * 0.3 * (0.2 + 0.8 * (1.0 - t))
-                # Only draw if visible
-                if radius > 0 and opacity > 0.0005:
-                    c.saveState()
-                    c.setFillColorRGB(r_val, g_val, b_val, alpha=opacity)
-                    shape_func(c, cx, cy, radius)
-                    c.restoreState()
-                break
 
 
 def parse_svg_dimensions(root):
@@ -505,7 +467,7 @@ def parse_svg_dimensions(root):
     return width, height, vb_x, vb_y, scale_x, scale_y
 
 
-def _parse_inline_style(style_str: str) -> Dict[str, str]: # Helper
+def _parse_inline_style(style_str: str) -> dict[str, str]: # Helper
     """Rudimentary parser for inline style attributes."""
     properties = {}
     if not style_str:
@@ -596,7 +558,8 @@ def extract_defs(root, ns):
                         r_val = int(stop_color_str[1:3],16)/255.0; g_val=int(stop_color_str[3:5],16)/255.0; b_val=int(stop_color_str[5:7],16)/255.0
                         color_tuple = (r_val,g_val,b_val,opacity)
                 if color_tuple: stops.append((offset, color_tuple))
-            all_gradients[gradient_id] = {'cx': cx, 'cy': cy, 'r': r_grad,'stops': stops}
+            all_gradients[gradient_id] = {'cx': cx, 'cy': cy, 'r': r_grad, 'stops': stops,
+                                          'units': radial_gradient.get('gradientUnits', 'objectBoundingBox')}
     in_defs = {id(node) for defs_node_check in root.findall('.//svg:defs', ns) for node in defs_node_check.iter()}
     for path in root.findall('.//svg:path', ns):  # Connection path logic
         # RDKit bonds usually defined by class, e.g. "bond-0" and explicit style.
@@ -668,7 +631,10 @@ def draw_circles_with_gradients(c, root, all_gradients, ns):
         if isinstance(fill, str) and fill in all_gradients:
             grad = all_gradients[fill]
             draw_radial_gradient_shape(c, cx, cy, r, grad['stops'],
-                                       lambda canvas, center_x, center_y, radius: canvas.circle(center_x, center_y, radius, fill=1, stroke=0))
+                                       lambda canvas, center_x, center_y, radius: canvas.circle(center_x, center_y,
+                                                                                                radius, fill = 1,
+                                                                                                stroke = 0),
+                                       _gradient_geometry(grad, (cx - r, cy - r, cx + r, cy + r)))
 
 
 def draw_connection_paths(c, connection_path_ids, all_paths, root=None, ns=None):
@@ -814,9 +780,8 @@ def register_bundled_fonts():
             pdfmetrics.registerFont(TTFont('CenturyGothic-Bold', bold_name))
             pdfmetrics.registerFontFamily('CenturyGothic', normal='CenturyGothic', bold='CenturyGothic-Bold')
             return 'CenturyGothic'
-        except:
-            # Continue to next filename variation if this one fails
-            continue
+        except Exception:
+            continue  # try the next filename variation
     font_name = 'Comfortaa'
     # Get the location of this module file and navigate to fonts directory
     this_dir = Path(__file__).parent / 'fonts'
@@ -884,22 +849,25 @@ def _render_svg_to_pdf_canvas(svg_data: str,
         final_fill_r, final_stroke_r, sw_r = _resolve_paint(rect_element, default_fill = 'none', use_opacity = True)
         x_r = float(rect_element.get('x', '0')); y_r = float(rect_element.get('y', '0'))
         w_r = float(rect_element.get('width', '0')); h_r = float(rect_element.get('height', '0'))
-        if isinstance(final_fill_r, str) and final_fill_r in all_gradients:
+        if isinstance(final_fill_r, str) and final_fill_r in all_gradients and all_gradients[final_fill_r]['stops']:
             grad_r_data = all_gradients[final_fill_r]
-            fill_color_for_rect_from_grad = None
-            if grad_r_data.get('stops'): fill_color_for_rect_from_grad = grad_r_data['stops'][0][1][:3]
-            draw_rect(c, x_r, y_r, w_r, h_r, final_stroke_r, fill_color_for_rect_from_grad, sw_r)
+            c.saveState()
+            c.setFillGradient(*_gradient_geometry(grad_r_data, (x_r, y_r, x_r + w_r, y_r + h_r)), grad_r_data['stops'])
+            draw_rect(c, x_r, y_r, w_r, h_r, final_stroke_r, grad_r_data['stops'][0][1][:3], sw_r)
+            c.restoreState()
         else:
             draw_rect(c, x_r, y_r, w_r, h_r, final_stroke_r, final_fill_r, sw_r)
     for ellipse_element in root.findall('.//svg:ellipse', ns):
         final_fill_e, final_stroke_e, sw_e = _resolve_paint(ellipse_element, default_fill = 'black')
         cx_e = float(ellipse_element.get('cx', '0')); cy_e = float(ellipse_element.get('cy', '0'))
         rx_e = float(ellipse_element.get('rx', '0')); ry_e = float(ellipse_element.get('ry', '0'))
-        if isinstance(final_fill_e, str) and final_fill_e in all_gradients:
+        if isinstance(final_fill_e, str) and final_fill_e in all_gradients and all_gradients[final_fill_e]['stops']:
             grad_e_data = all_gradients[final_fill_e]
-            fill_color_for_ellipse = None
-            if grad_e_data.get('stops'): fill_color_for_ellipse = grad_e_data['stops'][0][1][:3]
-            draw_ellipse(c, cx_e, cy_e, rx_e, ry_e, final_stroke_e, fill_color_for_ellipse, sw_e)
+            c.saveState()
+            c.setFillGradient(*_gradient_geometry(grad_e_data, (cx_e - rx_e, cy_e - ry_e, cx_e + rx_e, cy_e + ry_e)),
+                              grad_e_data['stops'])
+            draw_ellipse(c, cx_e, cy_e, rx_e, ry_e, final_stroke_e, grad_e_data['stops'][0][1][:3], sw_e)
+            c.restoreState()
         else:
             draw_ellipse(c, cx_e, cy_e, rx_e, ry_e, final_stroke_e, final_fill_e, sw_e)
     for path_element in root.findall('.//svg:path', ns):
@@ -911,15 +879,20 @@ def _render_svg_to_pdf_canvas(svg_data: str,
         if not path_data_p: continue
         final_fill_p, final_stroke_p, sw_p = _resolve_paint(path_element)
         path_commands_p = parse_path(path_data_p)
-        if isinstance(final_fill_p, str) and final_fill_p in all_gradients:
+        dash_p = _resolve_dash(path_element)
+        if isinstance(final_fill_p, str) and final_fill_p in all_gradients and all_gradients[final_fill_p]['stops']:
             grad_p = all_gradients[final_fill_p]
-            temp_fill_color = None
-            if grad_p.get('stops'):
-                first_stop_p = grad_p['stops'][0][1]
-                temp_fill_color = first_stop_p[:3] + (first_stop_p[3] if len(first_stop_p)>3 else 1.0,)
-            draw_path(c, path_commands_p, final_stroke_p, temp_fill_color, sw_p)
+            first_stop_p = grad_p['stops'][0][1]
+            pts_p = calculate_points(path_commands_p) or [(0, 0)]
+            bbox_p = (min(p[0] for p in pts_p), min(p[1] for p in pts_p), max(p[0] for p in pts_p),
+                      max(p[1] for p in pts_p))
+            c.saveState()
+            c.setFillGradient(*_gradient_geometry(grad_p, bbox_p), grad_p['stops'])
+            draw_path(c, path_commands_p, final_stroke_p,
+                      first_stop_p[:3] + (first_stop_p[3] if len(first_stop_p) > 3 else 1.0,), sw_p, dash_p)
+            c.restoreState()
         else:
-            draw_path(c, path_commands_p, final_stroke_p, final_fill_p, sw_p)
+            draw_path(c, path_commands_p, final_stroke_p, final_fill_p, sw_p, dash_p)
     process_text_elements(c, root, all_paths, ns, font_to_use)
     return c
 
@@ -928,64 +901,33 @@ def convert_chem_to_file(svg_data: str, file_path: Union[str, Path, None] = None
     if isinstance(svg_data, bytes):
         svg_data = svg_data.decode('utf-8')
     ext = 'png' if file_path is None else str(file_path).lower().split('.')[-1]
-    pdf_canvas_target: Union[str, Path, BytesIO]
-    temp_pdf_path: Union[str, None] = None
-    if ext == 'png':
-        if not FITZ_AVAILABLE:
-            warnings.warn("PyMuPDF (fitz) is not installed. PNG generation for 'chem' mode is not available.")
-            return None
-        _intermediate_temp_pdf_file = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-        temp_pdf_path = _intermediate_temp_pdf_file.name
-        _intermediate_temp_pdf_file.close()
-        pdf_canvas_target = temp_pdf_path
-    elif ext == 'pdf':
-        if return_bytes:
-            pdf_canvas_target = BytesIO()
-        else:
-            if file_path is None:
-                raise ValueError("file_path must be provided for PDF output if not returning bytes.")
-            pdf_canvas_target = file_path # type: ignore
-    else:
+    if ext not in ('png', 'pdf'):
         raise ValueError(f"Unsupported extension: {ext}")
-    canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_canvas_target, alt_text_info=None)
-    canvas_obj.save()
+    target = BytesIO() if (ext == 'pdf' and return_bytes) else (file_path if ext == 'pdf' else None)
+    canvas_obj = _render_svg_to_pdf_canvas(svg_data, target, alt_text_info = None)
     if ext == 'pdf':
+        canvas_obj.save()
         if return_bytes:
-            pdf_data = pdf_canvas_target.getvalue() # type: ignore
-            pdf_canvas_target.close() # type: ignore
-            return pdf_data
-        else:
-            return None
-    else: # ext == 'png'
-        if temp_pdf_path is None:
-            raise Exception("Internal error: temp PDF path for PNG (chem) not set.")
-        doc = fitz.open(temp_pdf_path)
-        page = doc.load_page(0)
-        pix = page.get_pixmap(dpi=300)
-        if return_bytes:
-            png_bytes = pix.tobytes("png")
-            doc.close()
-            os.unlink(temp_pdf_path)
-            return png_bytes
-        else: # save to file
-            if file_path is None:
-                doc.close()
-                os.unlink(temp_pdf_path)
-                raise ValueError("file_path must be provided for PNG output if not returning bytes.")
-            pix.save(str(file_path))
-            doc.close()
-            os.unlink(temp_pdf_path)
-            return None
+            data = target.getvalue()
+            target.close()
+            return data
+        return None
+    png = canvas_obj.to_png(300 / 72.0, 300 / 72.0)  # RDKit path renders at a fixed 300 dpi
+    if return_bytes:
+        return png
+    if file_path is None:
+        raise ValueError("file_path must be provided for PNG output if not returning bytes.")
+    with open(str(file_path), 'wb') as fh:
+        fh.write(png)
+    return None
 
 
 def convert_svg_to_pdf(svg_data: str, pdf_file_path: Union[str, Path], return_canvas: bool = False, chem: bool = False):
-    if chem:
-        if isinstance(svg_data, bytes):
-            svg_data = svg_data.decode('utf-8')
-        convert_chem_to_file(svg_data, file_path=pdf_file_path, return_bytes=False)
-        return None
     if isinstance(svg_data, bytes):
         svg_data = svg_data.decode('utf-8')
+    if chem:
+        convert_chem_to_file(svg_data, file_path = pdf_file_path, return_bytes = False)
+        return None
     alt_text_payload = None
     aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
     if aria_label_match:
@@ -1002,124 +944,46 @@ def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = No
                        output_width: Union[int, None] = None, output_height: Union[int, None] = None,
                        scale: Union[float, None] = None, return_bytes: bool = False,
                        chem: bool = False):
-    if chem:
-        if isinstance(svg_data, bytes):
-            svg_data = svg_data.decode('utf-8')
-        return convert_chem_to_file(svg_data, file_path=png_file_path, return_bytes=return_bytes)
-    if not FITZ_AVAILABLE:
-        warnings.warn(
-            "PyMuPDF (fitz) is not installed. PNG generation is not available. "
-            "Please install PyMuPDF (`pip install PyMuPDF`) to enable PNG export."
-        )
-        if return_bytes: return None
-        else: return None
-    if not return_bytes and png_file_path is None:
-        raise ValueError("png_file_path must be provided if return_bytes is False.")
     if isinstance(svg_data, bytes):
         svg_data = svg_data.decode('utf-8')
+    if chem:
+        return convert_chem_to_file(svg_data, file_path = png_file_path, return_bytes = return_bytes)
+    if not return_bytes and png_file_path is None:
+        raise ValueError("png_file_path must be provided if return_bytes is False.")
     aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
     alt_text = aria_label_match.group(1) if aria_label_match else None
-    alt_text_payload_for_pdf = {'alt_text': alt_text} if alt_text else None
-    temp_pdf_path_local: str
-    if png_file_path is None and return_bytes is True:
-        _temp_pdf_obj_bytes = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-        temp_pdf_path_local = _temp_pdf_obj_bytes.name
-        _temp_pdf_obj_bytes.close()
-    elif png_file_path is not None:
-        _temp_pdf_obj_file = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-        temp_pdf_path_local = _temp_pdf_obj_file.name
-        _temp_pdf_obj_file.close()
-    else: # Should not happen given the initial check
-        raise ValueError("Invalid state for png_file_path and return_bytes")
-    canvas_object = _render_svg_to_pdf_canvas(svg_data, temp_pdf_path_local, alt_text_info=alt_text_payload_for_pdf)
-    canvas_object.save()
-    doc = fitz.open(temp_pdf_path_local)
-    page = doc[0]
-    page_rect = page.rect
-    page_width = page_rect.width if page_rect.width > 1e-3 else 1.0
-    page_height = page_rect.height if page_rect.height > 1e-3 else 1.0
-    zoom_x, zoom_y = 1.0, 1.0
+    canvas_obj = _render_svg_to_pdf_canvas(svg_data, None, alt_text_info = {'alt_text': alt_text} if alt_text else None)
+    page_width = canvas_obj.width if canvas_obj.width > 1e-3 else 1.0
+    page_height = canvas_obj.height if canvas_obj.height > 1e-3 else 1.0
     if scale is not None:
         zoom_x = zoom_y = scale
     elif output_width is not None and output_height is not None:
-        zoom_x = output_width / page_width
-        zoom_y = output_height / page_height
+        zoom_x, zoom_y = output_width / page_width, output_height / page_height
     elif output_width is not None:
         zoom_x = zoom_y = output_width / page_width
     elif output_height is not None:
         zoom_x = zoom_y = output_height / page_height
-    zoom_matrix = fitz.Matrix(zoom_x, zoom_y)
-    pix = page.get_pixmap(matrix=zoom_matrix)
+    else:
+        zoom_x = zoom_y = 1.0
+    png = canvas_obj.to_png(zoom_x, zoom_y, texts = (('alt', alt_text),) if alt_text else ())
     if return_bytes:
-        png_data_bytes = pix.tobytes("png")
-        doc.close()
-        os.unlink(temp_pdf_path_local)
-        return png_data_bytes
-    else: # Save to file
-        if png_file_path is None: # Already checked, but for safety
-            doc.close()
-            os.unlink(temp_pdf_path_local)
-            raise ValueError("png_file_path is required for PNG file output.")
-        pix.save(str(png_file_path))
-        doc.close()
-        os.unlink(temp_pdf_path_local)
-        if alt_text and png_file_path:
-            try:
-                _inject_png_text(str(png_file_path), 'alt', alt_text)
-            except Exception:
-                pass
-        return None
-
-
-def _inject_png_text(png_path, keyword, value):
-    """Splice a tEXt chunk in front of the first IDAT so the alt text travels with the PNG."""
-    with open(png_path, 'rb') as fh:
-        data = fh.read()
-    at = data.index(b'IDAT') - 4
-    payload = keyword.encode('latin-1') + b'\x00' + value.encode('latin-1', 'replace')
-    chunk = struct.pack('>I', len(payload)) + b'tEXt' + payload + struct.pack('>I', zlib.crc32(b'tEXt' + payload) & 0xFFFFFFFF)
-    with open(png_path, 'wb') as fh:
-        fh.write(data[:at] + chunk + data[at:])
+        return png
+    with open(str(png_file_path), 'wb') as fh:
+        fh.write(png)
+    return None
 
 
 def pdf_to_svg_bytes(svg_string):
-    """Convert SVG → glycorender PDF → SVG for display in browser"""
-    with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False) as temp_pdf:
-        temp_pdf_path = temp_pdf.name
-    try:
-        convert_svg_to_pdf(svg_string, temp_pdf_path)
-        doc = fitz.open(temp_pdf_path)
-        page = doc[0]
-        svg_output = page.get_svg_image()
-        doc.close()
-        return svg_output
-    finally:
-        if os.path.exists(temp_pdf_path):
-            os.unlink(temp_pdf_path)
+    """Round-trip an SNFG SVG through the glycorender display list so the browser sees the PDF geometry."""
+    return _render_svg_to_pdf_canvas(svg_string, None, alt_text_info=None).to_svg()
 
 
 def simple_svg_to_pdf(svg_data: str, pdf_path: Union[str, Path]) -> None:
     """Convert composite SVG to PDF without additional glycan-specific rendering."""
-    if not FITZ_AVAILABLE:
-        raise ImportError("PyMuPDF (fitz) is required for PDF conversion")
-    if isinstance(svg_data, bytes):
-        svg_data = svg_data.decode('utf-8')
-    svg_doc = fitz.open("svg", svg_data.encode())
-    pdf_bytes = svg_doc.convert_to_pdf()
-    pdf_doc = fitz.open("pdf", pdf_bytes)
-    pdf_doc.save(str(pdf_path))
-    pdf_doc.close()
-    svg_doc.close()
+    svgin.build(svg_data, str(pdf_path), (font_to_use, font_to_use + '-Bold')).save()
 
 
 def simple_svg_to_png(svg_data: str, png_path: Union[str, Path]) -> None:
     """Convert composite SVG to PNG without additional glycan-specific rendering."""
-    if not FITZ_AVAILABLE:
-        raise ImportError("PyMuPDF (fitz) is required for PNG conversion")
-    if isinstance(svg_data, bytes):
-        svg_data = svg_data.decode('utf-8')
-    doc = fitz.open("svg", svg_data.encode())
-    page = doc.load_page(0)
-    pix = page.get_pixmap(dpi = 300)
-    pix.save(str(png_path))
-    doc.close()
+    with open(str(png_path), 'wb') as fh:
+        fh.write(svgin.build(svg_data, None, (font_to_use, font_to_use + '-Bold')).to_png(300 / 72.0, 300 / 72.0))
