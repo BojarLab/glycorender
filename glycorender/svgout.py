@@ -54,17 +54,27 @@ def _element(d, op, fill, stroke, grads = None, prefix = ''):
     return '<path ' + ' '.join(attrs) + ' />'
 
 
-def emit(ops, width, height):
+def _filter(shadow, name):
+    return ('<filter id="%s" x="-30%%" y="-30%%" width="160%%" height="160%%">'
+            '<feDropShadow dx="%s" dy="%s" stdDeviation="%s" flood-color="%s" flood-opacity="%s" />'
+            '</filter>' % (name, _fmt(shadow['dx']), _fmt(shadow['dy']),
+                           _fmt(shadow['blur']), _hex(shadow['color']), _fmt(shadow['alpha'])))
+
+
+def emit(ops, width, height, shadow = None):
     body, grads = [], {}
     prefix = 'grad%d_' % next(_DOC)
     for op in ops:
         if op['kind'] == 'path':
             if not (op['fill'] or op['stroke']): continue
-            body.append(_element(_d(op['path']), op, op['fill'], op['stroke'], grads, prefix))
+            el = _element(_d(op['path']), op, op['fill'], op['stroke'], grads, prefix)
+            if shadow and op['fill'] and op['stroke']:
+                el = el.replace('<path ', '<path filter="url(#%sshadow)" ' % prefix, 1)
+            body.append(el)
         else:
             ttf, pen, segs = op['ttf'], op['x'], []
-            for ch in op['text']:
-                gid = ttf.gid(ch)
+            gids = [ttf.gid(ch) for ch in op['text']]
+            for n, gid in enumerate(gids):
                 k = op['size'] / ttf.units_per_em
                 for cmd, a in ttf.outline(gid):
                     if cmd == 'M': segs.append('M ' + _fmt(a[0]*k + pen) + ' ' + _fmt(a[1]*k + op['y']))
@@ -72,17 +82,27 @@ def emit(ops, width, height):
                     elif cmd == 'Q': segs.append('Q ' + ' '.join(_fmt(v) for v in (a[0]*k+pen, a[1]*k+op['y'], a[2]*k+pen, a[3]*k+op['y'])))
                     elif cmd == 'Z': segs.append('Z')
                 pen += ttf.width(gid) * op['size'] / 1000.0 + op['char_space']
+                if n + 1 < len(gids):
+                    pen += ttf.kern(gid, gids[n + 1]) * k
             if segs: body.append(_element(' '.join(segs), op, True, False))
-    defs = ''
+    defs, entries = '', []
     if grads:
-        entries = []
-        for (cx, cy, r, stops), name in grads.items():
+        for (kind, geo, stops), name in grads.items():
             inner = ''.join('<stop offset="%s" stop-color="%s" stop-opacity="%s" />'
                             % (_fmt(o), _hex(c[:3]), _fmt(c[3])) for o, c in stops)
-            entries.append(
-                '<radialGradient id="%s" gradientUnits="userSpaceOnUse" cx="%s" cy="%s" r="%s">%s</radialGradient>'
-                % (name, _fmt(cx), _fmt(cy), _fmt(r), inner))
-        defs = '<defs>%s</defs>\n' % ''.join(entries)
+            if kind == 'radial':
+                entries.append(
+                    '<radialGradient id="%s" gradientUnits="userSpaceOnUse" cx="%s" cy="%s" r="%s">%s</radialGradient>'
+                    % ((name,) + tuple(_fmt(v) for v in geo) + (inner,)))
+            else:
+                entries.append(
+                    '<linearGradient id="%s" gradientUnits="userSpaceOnUse" x1="%s" y1="%s" x2="%s" y2="%s">%s</linearGradient>'
+                    % ((name,) + tuple(_fmt(v) for v in geo) + (inner,)))
+        defs = ''.join(entries)
+    if shadow:
+        defs += _filter(shadow, prefix + 'shadow')
+    if defs:
+        defs = '<defs>%s</defs>\n' % defs
     return ('<?xml version="1.0" encoding="UTF-8"?>\n'
             '<svg xmlns="http://www.w3.org/2000/svg" width="%s" height="%s" viewBox="0 0 %s %s">\n'
             '%s<g transform="matrix(1 0 0 -1 0 %s)">\n%s\n</g>\n</svg>\n'

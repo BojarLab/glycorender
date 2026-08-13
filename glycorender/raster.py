@@ -235,8 +235,8 @@ def _glyph_paths(op, ctm):
     ttf = op['ttf']
     k = op['size'] / ttf.units_per_em
     pen = op['x']
-    for ch in op['text']:
-        gid = ttf.gid(ch)
+    gids = [ttf.gid(ch) for ch in op['text']]
+    for i, gid in enumerate(gids):
         cmds = ttf.outline(gid)
         if cmds:
             place = _mul((k, 0.0, 0.0, k, pen, op['y']), ctm)
@@ -258,6 +258,8 @@ def _glyph_paths(op, ctm):
                     cur = start
             yield path, place
         pen += ttf.width(gid) * op['size'] / 1000.0 + op['char_space']
+        if i + 1 < len(gids):
+            pen += ttf.kern(gid, gids[i + 1]) * k
 
 
 class Image:
@@ -293,31 +295,43 @@ class Image:
         if x1 <= x0 or y1 <= y0: return
         cov = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd)
         if not cov.any(): return
-        cx, cy, r, stops = grad
+        kind, geo, stops = grad
         px, py = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
         ux = inv[0] * px + inv[2] * py + inv[4]
         uy = inv[1] * px + inv[3] * py + inv[5]
-        t = np.hypot(ux - cx, uy - cy) / (r if abs(r) > 1e-9 else 1e-9)
+        if kind == 'radial':
+            cx, cy, r = geo
+            t = np.hypot(ux - cx, uy - cy) / (r if abs(r) > 1e-9 else 1e-9)
+        else:
+            ax, ay, bx, by = geo
+            dx, dy = bx - ax, by - ay
+            span = dx * dx + dy * dy
+            t = ((ux - ax) * dx + (uy - ay) * dy) / (span if span > 1e-12 else 1e-12)
         cr, cg, cb, ca = sample_stops(stops, t)
         a = cov * ca * alpha
         sub = self.buf[y0:y1, x0:x1]
         a3 = a[:, :, None]
         sub[:, :, :3] = sub[:, :, :3] * (1 - a3) + np.dstack([cr, cg, cb]) * a3
         sub[:, :, 3] = sub[:, :, 3] * (1 - a) + a
-    def rgb(self, background = (1.0, 1.0, 1.0)):
-        bg = np.asarray(background, dtype = np.float64)
+    def rgb(self, background = None):
         a = self.buf[:, :, 3:4]
-        out = self.buf[:, :, :3] + bg * (1 - a)
+        if background is None:  # keep the alpha channel; the buffer is premultiplied
+            out = np.concatenate([np.divide(self.buf[:, :, :3], a, out = np.zeros_like(self.buf[:, :, :3]),
+                                            where = a > 1e-6), a], axis = 2)
+        else:
+            out = self.buf[:, :, :3] + np.asarray(background, dtype = np.float64) * (1 - a)
         return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
 def encode_png(arr, texts = ()):
-    """uint8 (H,W,3) -> PNG bytes, with optional (keyword, value) tEXt chunks."""
+    """uint8 (H,W,3) or (H,W,4) -> PNG bytes, with optional (keyword, value) tEXt chunks."""
+    if arr.shape[2] == 4 and arr[:, :, 3].min() == 255:
+        arr = arr[:, :, :3]  # nothing is transparent, so don't pay for an alpha channel
     h, w = arr.shape[:2]
     raw = np.hstack([np.zeros((h, 1), dtype = np.uint8), arr.reshape(h, -1)]).tobytes()
     def chunk(tag, body):
         return struct.pack('>I', len(body)) + tag + body + struct.pack('>I', zlib.crc32(tag + body) & 0xFFFFFFFF)
-    out = [b'\x89PNG\r\n\x1a\n', chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))]
+    out = [b'\x89PNG\r\n\x1a\n', chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6 if arr.shape[2] == 4 else 2, 0, 0, 0))]
     for key, value in texts:
         out.append(chunk(b'tEXt', key.encode('latin-1') + b'\x00' + value.encode('latin-1', 'replace')))
     out.append(chunk(b'IDAT', zlib.compress(raw, 6)))
@@ -325,12 +339,62 @@ def encode_png(arr, texts = ()):
     return b''.join(out)
 
 
-def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = (1.0, 1.0, 1.0)):
-    """Rasterize a pdfwrite display list. PDF y-up is flipped to image y-down here."""
+def _box_blur(a, radius):
+    """Three box passes approximate a Gaussian closely enough for a shadow."""
+    if radius < 1: return a
+    k = 2 * int(radius) + 1
+    for _ in range(3):
+        for axis in (0, 1):
+            pad = np.pad(a, ((k // 2, k // 2), (0, 0)) if axis == 0 else ((0, 0), (k // 2, k // 2)))
+            c = np.cumsum(pad, axis = axis)
+            head = c[k - 1:k] if axis == 0 else c[:, k - 1:k]
+            rest = (c[k:] - c[:-k]) if axis == 0 else (c[:, k:] - c[:, :-k])
+            a = (np.vstack([head, rest]) if axis == 0 else np.hstack([head, rest])) / k
+    return a
+
+
+def _shadow_mask(ops, w, h, flip, dx, dy):
+    """Alpha coverage of every filled-and-stroked shape (i.e., the SNFG symbols), offset."""
+    layer = Image(w, h)
+    shift = _mul(flip, (1.0, 0.0, 0.0, 1.0, dx, dy))
+    for op in ops:
+        if op['kind'] != 'path' or not (op['fill'] and op['stroke']):
+            continue
+        ctm = _mul(op['ctm'], shift)
+        if _inv(ctm) is None: continue
+        subs = flatten(op['path'], ctm)
+        if not subs: continue
+        layer.paint(_edges(subs, True), (0.0, 0.0, 0.0), 1.0, op.get('even_odd', False))
+        sc = math.sqrt(abs(ctm[0] * ctm[3] - ctm[1] * ctm[2])) or 1.0
+        layer.paint(_edges(stroke_polys(subs, op['line_width'] * sc, op['cap'], op['join']), True),
+                    (0.0, 0.0, 0.0), 1.0)
+    return layer.buf[:, :, 3]
+
+
+def shadow_alpha(ops, width, height, shadow, dpi = 150.0):
+    """Blurred shadow coverage as a uint8 mask, for use as a PDF luminosity soft mask."""
+    sc = dpi / 72.0
+    w, h = max(1, int(round(width * sc))), max(1, int(round(height * sc)))
+    flip = (sc, 0.0, 0.0, -sc, 0.0, float(h))
+    mask = _box_blur(_shadow_mask(ops, w, h, flip, shadow['dx'] * sc, shadow['dy'] * sc),
+                     max(1, int(round(shadow['blur'] * sc))))
+    a = np.clip(mask * shadow['alpha'], 0.0, 1.0)
+    return w, h, np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, shadow = None):
+    """Rasterize a pdfwrite display list; `background` None keeps alpha. PDF y-up is flipped to image y-down here."""
     w = max(1, int(round(width * scale_x)))
     h = max(1, int(round(height * scale_y)))
     flip = (scale_x, 0.0, 0.0, -scale_y, 0.0, float(h))
     img = Image(w, h)
+    if shadow:
+        sc = (scale_x + scale_y) / 2.0
+        mask = _box_blur(_shadow_mask(ops, w, h, flip, shadow['dx'] * sc, shadow['dy'] * sc),
+                         max(1, int(round(shadow['blur'] * sc))))
+        a = np.clip(mask * shadow['alpha'], 0.0, 1.0)
+        img.buf[:, :, :3] = np.asarray(shadow['color'], dtype = np.float64) * a[:, :, None]
+        img.buf[:, :, 3] = a
     for op in ops:
         ctm = _mul(op['ctm'], flip)
         if _inv(ctm) is None: continue

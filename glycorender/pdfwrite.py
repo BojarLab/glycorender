@@ -56,6 +56,48 @@ def _stop_function(out, stops, channels):
                        ' '.join(['0 1'] * len(fns)))).encode())
 
 
+def _kerned_run(ttf, text):
+    """Glyph string as a TJ array; a positive TJ number shifts left, so kerns are negated."""
+    gids = [ttf.gid(ch) for ch in text]
+    parts, chunk = [], []
+    for i, g in enumerate(gids):
+        chunk.append('%04X' % g)
+        k = ttf.kern(g, gids[i + 1]) if i + 1 < len(gids) else 0
+        if k:
+            parts.append('<%s>' % ''.join(chunk))
+            parts.append(_fmt(-k * 1000.0 / ttf.units_per_em))
+            chunk = []
+    if chunk:
+        parts.append('<%s>' % ''.join(chunk))
+    return '[%s]' % ' '.join(parts)
+
+
+def shadow_params(ops, shadow):
+    """Turn `shadow=True` into a spec, scaling offset and blur to the typical symbol size.
+
+    Offsets and blur are in points, so the result is resolution independent. Positive dy is
+    downwards: the key light sits above and slightly left, as illustration convention expects.
+    """
+    if not shadow:
+        return None
+    spec = dict(shadow) if isinstance(shadow, dict) else {}
+    sizes = []
+    for op in ops:
+        if op['kind'] != 'path' or not (op['fill'] and op['stroke']):
+            continue
+        xs = [seg[i] for seg in op['path'] for i in range(1, len(seg), 2)]
+        ys = [seg[i] for seg in op['path'] for i in range(2, len(seg), 2)]
+        if xs:
+            sizes.append(max(max(xs) - min(xs), max(ys) - min(ys)))
+    unit = sorted(sizes)[len(sizes) // 2] if sizes else 50.0
+    spec.setdefault('dx', 0.03 * unit)
+    spec.setdefault('dy', 0.05 * unit)
+    spec.setdefault('blur', 0.07 * unit)
+    spec.setdefault('alpha', 0.38)
+    spec.setdefault('color', (0.0, 0.0, 0.0))
+    return spec
+
+
 def _grad_index(shadings, grad, bbox, alpha):
     key = (grad, bbox, round(alpha, 4))
     if key not in shadings:
@@ -142,6 +184,8 @@ class Canvas:
         self.stack = []
         self._font = None
         self._size = 0
+        self.shadow = None
+
     # --- state ---
     def saveState(self):
         self.stack.append(dict(self.state))
@@ -150,9 +194,12 @@ class Canvas:
     def setFillColorRGB(self, r, g, b, alpha=None):
         self.state['fill_rgb'] = (r, g, b)
         if alpha is not None: self.state['fill_alpha'] = alpha
-    def setFillGradient(self, cx, cy, r, stops):
-        """Radial gradient fill in the current user space; supersedes the flat fill until reset."""
-        self.state['fill_grad'] = (float(cx), float(cy), float(r), tuple(norm_stops(stops)))
+    def setFillGradient(self, kind, coords, stops):
+        """Gradient fill in the current user space; supersedes the flat fill until reset.
+
+        kind is 'radial' with coords (cx, cy, r), or 'linear' with coords (x1, y1, x2, y2).
+        """
+        self.state['fill_grad'] = (kind, tuple(float(v) for v in coords), tuple(norm_stops(stops)))
     def setStrokeColorRGB(self, r, g, b, alpha=None):
         self.state['stroke_rgb'] = (r, g, b)
         if alpha is not None: self.state['stroke_alpha'] = alpha
@@ -228,19 +275,24 @@ class Canvas:
         self.info['Keywords'] = v
 
     # --- backends ---
-    def to_png(self, scale_x = 1.0, scale_y = 1.0, background = (1.0, 1.0, 1.0), texts = ()):
+    def to_png(self, scale_x = 1.0, scale_y = 1.0, background = None, texts = ()):
         from . import raster
-        return raster.encode_png(raster.render(self.ops, self.width, self.height, scale_x, scale_y, background),
-                                 texts)
+        return raster.encode_png(
+            raster.render(self.ops, self.width, self.height, scale_x, scale_y, background,
+                          shadow_params(self.ops, self.shadow)), texts)
 
     def to_svg(self):
         from .svgout import emit
-        return emit(self.ops, self.width, self.height)
+        return emit(self.ops, self.width, self.height, shadow_params(self.ops, self.shadow))
 
     # --- PDF output ---
-    def _path_bbox(self, path, cx, cy, r):
-        xs = [cx - r, cx + r]
-        ys = [cy - r, cy + r]
+    def _path_bbox(self, path, grad):
+        kind, coords = grad[0], grad[1]
+        if kind == 'radial':
+            cx, cy, r = coords
+            xs, ys = [cx - r, cx + r], [cy - r, cy + r]
+        else:
+            xs, ys = [coords[0], coords[2]], [coords[1], coords[3]]
         for seg in path:
             for i in range(1, len(seg), 2):
                 xs.append(seg[i])
@@ -262,7 +314,7 @@ class Canvas:
                         for seg in op['path']]
                 eo = '*' if op.get('even_odd') else ''
                 if op['fill'] and grad:  # paint the shading through the shape used as a clip
-                    idx = _grad_index(shadings, grad, self._path_bbox(op['path'], *grad[:3]), op['fill_alpha'])
+                    idx = _grad_index(shadings, grad, self._path_bbox(op['path'], grad), op['fill_alpha'])
                     buf.append('q')
                     buf.extend(path)
                     buf.append('W%s n' % eo)
@@ -285,21 +337,39 @@ class Canvas:
             else:
                 buf.append('/%s gs' % _alpha_name(alphas, op['fill_alpha'], False))
                 buf.append('%s %s %s rg' % tuple(_fmt(v) for v in op['fill_rgb']))
-                gids = ''.join('%04X' % op['ttf'].gid(ch) for ch in op['text'])
-                buf.append('BT /%s %s Tf %s Tc 1 0 0 1 %s %s Tm <%s> Tj ET'
+                buf.append('BT /%s %s Tf %s Tc 1 0 0 1 %s %s Tm %s TJ ET'
                            % (op['font'], _fmt(op['size']), _fmt(op['char_space']), _fmt(op['x']), _fmt(op['y']),
-                              gids))
+                              _kerned_run(op['ttf'], op['text'])))
             buf.append('Q')
         return '\n'.join(buf)
 
+    def _shadow_object(self, out):
+        """Flat shadow color behind a grayscale soft mask; a blurred shadow cannot stay vector."""
+        from . import raster
+        spec = shadow_params(self.ops, self.shadow)
+        w, h, mask = raster.shadow_alpha(self.ops, self.width, self.height, spec)
+        packed = zlib.compress(mask.tobytes(), 9)
+        smask = out.add(('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray '
+                         '/BitsPerComponent 8 /Filter /FlateDecode /Length %d >>\nstream\n'
+                         % (w, h, len(packed))).encode() + packed + b'\nendstream')
+        rgb = bytes(bytearray(int(round(v * 255)) for v in spec['color']) * (w * h))
+        body = zlib.compress(rgb, 9)
+        return out.add(('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB '
+                        '/BitsPerComponent 8 /Filter /FlateDecode /SMask %d 0 R /Length %d >>\nstream\n'
+                        % (w, h, smask, len(body))).encode() + body + b'\nendstream')
     def _shading_objects(self, out, grad, bbox, alpha):
         """Radial shading plus the luminosity soft mask that carries its per-stop alpha."""
-        cx, cy, r, stops = grad
-        coords = '[%s %s 0 %s %s %s]' % (_fmt(cx), _fmt(cy), _fmt(cx), _fmt(cy), _fmt(r))
-        sh = out.add(('<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords %s /Function %d 0 R /Extend [true true] >>'
-                      % (coords, _stop_function(out, stops, (0, 1, 2)))).encode())
-        alpha_sh = out.add(('<< /ShadingType 3 /ColorSpace /DeviceGray /Coords %s /Function %d 0 R /Extend [true true] >>'
-                            % (coords, _stop_function(out, stops, (3,)))).encode())
+        kind, geo, stops = grad
+        if kind == 'radial':
+            cx, cy, r = geo
+            stype, coords = 3, '[%s %s 0 %s %s %s]' % (_fmt(cx), _fmt(cy), _fmt(cx), _fmt(cy), _fmt(r))
+        else:
+            stype, coords = 2, '[%s %s %s %s]' % tuple(_fmt(v) for v in geo)
+        sh = out.add(('<< /ShadingType %d /ColorSpace /DeviceRGB /Coords %s /Function %d 0 R /Extend [true true] >>'
+                      % (stype, coords, _stop_function(out, stops, (0, 1, 2)))).encode())
+        alpha_sh = out.add(
+            ('<< /ShadingType %d /ColorSpace /DeviceGray /Coords %s /Function %d 0 R /Extend [true true] >>'
+             % (stype, coords, _stop_function(out, stops, (3,)))).encode())
         body = b'/S0 sh'
         form = out.add(('<< /Type /XObject /Subtype /Form /BBox [%s %s %s %s] '
                         '/Group << /Type /Group /S /Transparency /CS /DeviceGray >> '
@@ -348,7 +418,12 @@ class Canvas:
     def save(self):
         out = _Writer()
         alphas, shadings = {}, {}
-        content = zlib.compress(self._content(alphas, shadings).encode('latin-1'), 9)
+        body = self._content(alphas, shadings)
+        xobj = ''
+        if self.shadow:
+            xobj = '/Shadow %d 0 R' % self._shadow_object(out)
+            body = 'q %s 0 0 %s 0 0 cm /Shadow Do Q\n' % (_fmt(self.width), _fmt(self.height)) + body
+        content = zlib.compress(body.encode('latin-1'), 9)
         stream = out.add(b'<< /Length %d /Filter /FlateDecode >>\nstream\n' % len(content) + content + b'\nendstream')
         fonts = ' '.join('/%s %d 0 R' % (n, self._font_objects(out, n, f)) for n, f in self.used.items())
         gs = [('/%s << /Type /ExtGState /%s %s >>' % (n, 'CA' if k[1] else 'ca', _fmt(k[0]))) for k, n in
@@ -358,7 +433,8 @@ class Canvas:
             ref, ext = self._shading_objects(out, grad, bbox, alpha)
             sh.append('/Sh%d %d 0 R' % (idx, ref))
             gs.append('/GSh%d %s' % (idx, ext))
-        res = '<< /Font << %s >> /ExtGState << %s >> /Shading << %s >> >>' % (fonts, ' '.join(gs), ' '.join(sh))
+        res = '<< /Font << %s >> /ExtGState << %s >> /Shading << %s >> /XObject << %s >> >>' % (
+            fonts, ' '.join(gs), ' '.join(sh), xobj)
         pages_ref = out.reserve()
         page = out.add(('<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %s %s] /Resources %s /Contents %d 0 R >>'
                         % (pages_ref, _fmt(self.width), _fmt(self.height), res, stream)).encode())

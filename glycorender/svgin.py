@@ -209,9 +209,9 @@ class _Renderer:
         for child in el: self.collect(child)
 
     def gradient(self, ref, bbox):
-        """Resolve a url(#id) paint to (cx, cy, r, stops) in user space, or None."""
+        """Resolve a url(#id) paint to (kind, coords, stops) in user space, or None."""
         node = self.defs.get(ref[5:-1]) if ref.startswith('url(#') else None
-        if node is None or _tag(node) != 'radialGradient': return None
+        if node is None or _tag(node) not in ('radialGradient', 'linearGradient'): return None
         stops = []
         for stop in node:
             if _tag(stop) != 'stop': continue
@@ -225,13 +225,18 @@ class _Renderer:
             stops.append((_num(stop.get('offset')), col + (_num(style.get('stop-opacity'), 1.0),)))
         if not stops: return None
         x0, y0, x1, y1 = bbox
-        if node.get('gradientUnits') == 'userSpaceOnUse':
-            cx, cy, r = _num(node.get('cx')), _num(node.get('cy')), _num(node.get('r'))
-        else:
-            cx = x0 + (x1 - x0) * _num(node.get('cx'), 0.5)
-            cy = y0 + (y1 - y0) * _num(node.get('cy'), 0.5)
-            r = _num(node.get('r'), 0.5) * max(x1 - x0, y1 - y0)
-        return (cx, cy, r, stops)
+        w, h = x1 - x0, y1 - y0
+        user_space = node.get('gradientUnits') == 'userSpaceOnUse'
+        if _tag(node) == 'linearGradient':
+            ax, ay = _num(node.get('x1'), 0.0), _num(node.get('y1'), 0.0)
+            bx, by = _num(node.get('x2'), 1.0), _num(node.get('y2'), 0.0)
+            if user_space:
+                return ('linear', (ax, ay, bx, by), stops)
+            return ('linear', (x0 + w * ax, y0 + h * ay, x0 + w * bx, y0 + h * by), stops)
+        if user_space:
+            return ('radial', (_num(node.get('cx')), _num(node.get('cy')), _num(node.get('r'))), stops)
+        return ('radial', (x0 + w * _num(node.get('cx'), 0.5), y0 + h * _num(node.get('cy'), 0.5),
+                           _num(node.get('r'), 0.5) * max(w, h)), stops)
 
     def paint(self, path, style, ctm, clip):
         if not path: return
@@ -244,7 +249,7 @@ class _Renderer:
             if pts:
                 xs, ys = [p[0] for p in pts], [p[1] for p in pts]
                 grad = self.gradient(raw_fill, (min(xs), min(ys), max(xs), max(ys)))
-            if grad: fill = grad[3][0][1][:3]
+            if grad: fill = grad[2][0][1][:3]
         if fill is None and stroke is None: return
         alpha = _num(style.get('opacity'), 1.0)
         self.c.saveState()

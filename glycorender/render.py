@@ -425,12 +425,27 @@ def calculate_points(commands):
     return points
 
 
+def _grad_num(el, key, default):
+    raw = el.get(key)
+    if raw is None:
+        return default
+    return float(raw.replace('%', '')) / 100 if '%' in raw else float(raw)
+
+
 def _gradient_geometry(grad, bbox):
-    """Gradient center and radius in user space; objectBoundingBox fractions map onto the shape's box."""
-    if grad.get('units', 'objectBoundingBox') == 'userSpaceOnUse':
-        return grad['cx'], grad['cy'], grad['r']
+    """Gradient geometry in user space; objectBoundingBox fractions map onto the shape's box."""
+    kind = grad.get('kind', 'radial')
+    user_space = grad.get('units', 'objectBoundingBox') == 'userSpaceOnUse'
     x0, y0, x1, y1 = bbox
-    return x0 + (x1 - x0) * grad['cx'], y0 + (y1 - y0) * grad['cy'], grad['r'] * max(x1 - x0, y1 - y0)
+    w, h = x1 - x0, y1 - y0
+    if kind == 'linear':
+        ax, ay, bx, by = grad.get('axis', [0.0, 0.0, 1.0, 0.0])
+        if user_space:
+            return kind, (ax, ay, bx, by)
+        return kind, (x0 + w * ax, y0 + h * ay, x0 + w * bx, y0 + h * by)
+    if user_space:
+        return kind, (grad['cx'], grad['cy'], grad['r'])
+    return kind, (x0 + w * grad['cx'], y0 + h * grad['cy'], grad['r'] * max(w, h))
 
 
 def draw_radial_gradient_shape(c, cx, cy, r, stops, shape_func, geometry = None):
@@ -438,7 +453,8 @@ def draw_radial_gradient_shape(c, cx, cy, r, stops, shape_func, geometry = None)
     if not stops:
         return
     c.saveState()
-    c.setFillGradient(*(geometry or (cx, cy, r)), stops)
+    kind, coords = geometry or ('radial', (cx, cy, r))
+    c.setFillGradient(kind, coords, stops)
     shape_func(c, cx, cy, r)
     c.restoreState()
 
@@ -518,7 +534,7 @@ def _resolve_dash(elem):
         return None
 
 
-def extract_defs(root, ns):
+def extract_defs(root, ns, elem_ctm = None):
     all_paths = {}
     all_gradients = {}
     for defs in root.findall('.//svg:defs', ns):
@@ -533,9 +549,11 @@ def extract_defs(root, ns):
                 'points': path_points, 'commands': path_commands, 'dash': _resolve_dash(path),
                 'stroke': final_stroke, 'fill': final_fill, 'stroke_width': stroke_width_val
             }
-        for radial_gradient in defs.findall('.//svg:radialGradient', ns):
+        for radial_gradient in list(defs.findall('.//svg:radialGradient', ns)) + list(
+                defs.findall('.//svg:linearGradient', ns)):
             gradient_id = radial_gradient.get('id', '')
             if not gradient_id: continue
+            kind = 'linear' if radial_gradient.tag.endswith('linearGradient') else 'radial'
             cx = float(radial_gradient.get('cx', '0.5').replace('%',''))/100 if '%' in radial_gradient.get('cx','0.5') else float(radial_gradient.get('cx','0.5'))
             cy = float(radial_gradient.get('cy', '0.5').replace('%',''))/100 if '%' in radial_gradient.get('cy','0.5') else float(radial_gradient.get('cy','0.5'))
             r_grad = float(radial_gradient.get('r', '0.5').replace('%',''))/100 if '%' in radial_gradient.get('r','0.5') else float(radial_gradient.get('r','0.5'))
@@ -558,7 +576,8 @@ def extract_defs(root, ns):
                         r_val = int(stop_color_str[1:3],16)/255.0; g_val=int(stop_color_str[3:5],16)/255.0; b_val=int(stop_color_str[5:7],16)/255.0
                         color_tuple = (r_val,g_val,b_val,opacity)
                 if color_tuple: stops.append((offset, color_tuple))
-            all_gradients[gradient_id] = {'cx': cx, 'cy': cy, 'r': r_grad, 'stops': stops,
+            axis = [_grad_num(radial_gradient, k, dv) for k, dv in (('x1', 0.0), ('y1', 0.0), ('x2', 1.0), ('y2', 0.0))]
+            all_gradients[gradient_id] = {'kind': kind, 'cx': cx, 'cy': cy, 'r': r_grad, 'axis': axis, 'stops': stops,
                                           'units': radial_gradient.get('gradientUnits', 'objectBoundingBox')}
     in_defs = {id(node) for defs_node_check in root.findall('.//svg:defs', ns) for node in defs_node_check.iter()}
     for path in root.findall('.//svg:path', ns):  # Connection path logic
@@ -572,6 +591,7 @@ def extract_defs(root, ns):
             path_points = calculate_points(path_commands)
             all_paths[path_id] = {
                 'points': path_points, 'commands': path_commands, 'is_connection': True, 'dash': _resolve_dash(path),
+                'ctm': elem_ctm.get(id(path), _IDENTITY) if elem_ctm is not None else _IDENTITY,
                 'stroke': final_stroke_conn, 'fill': final_fill_conn, 'stroke_width': stroke_width_val_conn
             }
     return all_paths, all_gradients
@@ -598,7 +618,32 @@ def draw_ellipse(c, cx, cy, rx, ry, stroke_color=None, fill_color=None, stroke_w
     c.restoreState()
 
 
-def find_connection_paths(root, all_paths, ns):
+_IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+
+def _apply_ctm(c, elem_ctm, el):
+    """Push the element's accumulated ancestor transform; caller restores."""
+    c.saveState()
+    if elem_ctm is not None:
+        c.transform(*elem_ctm.get(id(el), _IDENTITY))
+
+
+def element_transforms(root):
+    """Accumulated transform for every element, so nested <g transform=...> is honoured.
+
+    glycowork wraps brackets and Domon-Costello Z/Y markers in rotated groups; without this
+    their children were drawn unrotated.
+    """
+    out, stack = {}, [(root, _IDENTITY)]
+    while stack:
+        el, parent = stack.pop()
+        m = svgin._mul(svgin._transform(el.get('transform')), parent)
+        out[id(el)] = m
+        stack.extend((child, m) for child in el)
+    return out
+
+
+def find_connection_paths(root, all_paths, ns, elem_ctm = None):
     """Find connection paths which are used as lines between elements."""
     connection_path_ids = set()
     for use_elem in root.findall('.//svg:use', ns):
@@ -611,6 +656,8 @@ def find_connection_paths(root, all_paths, ns):
         if path_id in all_paths:
             # Check if this is likely a connection path by looking at its properties
             path_info = all_paths[path_id]
+            if elem_ctm is not None:  # a <use> places the def, so its transform is the one that counts
+                path_info['ctm'] = elem_ctm.get(id(use_elem), _IDENTITY)
             # Connection paths typically have a stroke but no fill
             if path_info['stroke'] and not path_info['fill']:
                 connection_path_ids.add(path_id)
@@ -621,20 +668,24 @@ def find_connection_paths(root, all_paths, ns):
     return connection_path_ids
 
 
-def draw_circles_with_gradients(c, root, all_gradients, ns):
+def draw_circles_with_gradients(c, root, all_gradients, ns, elem_ctm = None):
     """Draw circles with gradient fills."""
     for circle in root.findall('.//svg:circle', ns):
+        _apply_ctm(c, elem_ctm, circle)
         cx = float(circle.get('cx', '0'))
         cy = float(circle.get('cy', '0'))
         r = float(circle.get('r', '0'))
         fill = parse_color(circle.get('fill', 'none'))
-        if isinstance(fill, str) and fill in all_gradients:
-            grad = all_gradients[fill]
-            draw_radial_gradient_shape(c, cx, cy, r, grad['stops'],
-                                       lambda canvas, center_x, center_y, radius: canvas.circle(center_x, center_y,
-                                                                                                radius, fill = 1,
-                                                                                                stroke = 0),
-                                       _gradient_geometry(grad, (cx - r, cy - r, cx + r, cy + r)))
+        if not (isinstance(fill, str) and fill in all_gradients):
+            c.restoreState()
+            continue
+        grad = all_gradients[fill]
+        draw_radial_gradient_shape(c, cx, cy, r, grad['stops'],
+                                   lambda canvas, center_x, center_y, radius: canvas.circle(center_x, center_y,
+                                                                                            radius, fill = 1,
+                                                                                            stroke = 0),
+                                   _gradient_geometry(grad, (cx - r, cy - r, cx + r, cy + r)))
+        c.restoreState()
 
 
 def draw_connection_paths(c, connection_path_ids, all_paths, root=None, ns=None):
@@ -642,11 +693,14 @@ def draw_connection_paths(c, connection_path_ids, all_paths, root=None, ns=None)
     c.setLineCap(1)  # Set round cap for all connection lines
     for path_id in connection_path_ids:
         path_info = all_paths[path_id]
+        c.saveState()
+        c.transform(*path_info.get('ctm', _IDENTITY))
         commands = path_info['commands'][:]  # Copy to avoid modifying original
         # Check if this path ends at an invisible circle and shorten if needed
         if root is not None and ns is not None and commands:
             commands = shorten_if_invisible_endpoint(commands, root, ns)
         draw_path(c, commands, path_info['stroke'], None, path_info['stroke_width'], dash = path_info.get('dash'))
+        c.restoreState()
 
 def shorten_if_invisible_endpoint(commands, root, ns):
     """Shorten connection path if it ends at an invisible circle."""
@@ -703,9 +757,10 @@ def draw_direct_text(c, text, x, y, font_to_use, font_size, fill_color=None, tex
     c.restoreState()
 
 
-def process_text_elements(c, root, all_paths, ns, font_to_use):
+def process_text_elements(c, root, all_paths, ns, font_to_use, elem_ctm = None):
     """Process and draw text elements including text on paths."""
     for text in root.findall('.//svg:text', ns):
+        _apply_ctm(c, elem_ctm, text)
         font_size = float(text.get('font-size', '12'))
         fill = parse_color(text.get('fill', '#000000'))
         text_anchor = text.get('text-anchor', 'start')
@@ -719,6 +774,7 @@ def process_text_elements(c, root, all_paths, ns, font_to_use):
             text_content = text.text.strip()
             if text_content:
                 draw_direct_text(c, text_content, x, y, font_to_use, font_size, fill, text_anchor)
+            c.restoreState()
             continue
         for textpath in text.findall('.//svg:textPath', ns):
             href = textpath.get('{http://www.w3.org/1999/xlink}href')
@@ -754,7 +810,8 @@ def process_text_elements(c, root, all_paths, ns, font_to_use):
             elif start_offset.isdigit():
                 offset_percent = float(start_offset) / path_length(path_points) * 100
             draw_text_on_path(c, text_content, path_points, offset_percent,
-                              font_to_use, font_size, fill, text_anchor, offset_y=offset_y, is_bold=is_bold)
+                              font_to_use, font_size, fill, text_anchor, offset_y = offset_y, is_bold = is_bold)
+        c.restoreState()
 
 
 def register_bundled_fonts():
@@ -818,34 +875,29 @@ def _render_svg_to_pdf_canvas(svg_data: str,
         c.setAuthor("GlycoDraw")
         c.setSubject("Glycan Visualization")
         c.setKeywords(f"glycan;carbohydrate;glycowork;Description: {current_alt_text}")
-    all_paths, all_gradients = extract_defs(root, ns)
-    connection_path_ids = find_connection_paths(root, all_paths, ns)
+    elem_ctm = element_transforms(root)
+    all_paths, all_gradients = extract_defs(root, ns, elem_ctm)
+    connection_path_ids = find_connection_paths(root, all_paths, ns, elem_ctm)
     c.translate(0, height)
     c.scale(1, -1)
     c.translate(-vb_x * scale_x, -vb_y * scale_y)
     c.scale(scale_x, scale_y)
-    g_element = root.find('./svg:g', ns)
-    if g_element is not None:
-        g_transform = g_element.get('transform', '')
-        if g_transform.startswith('rotate(90'):
-            pivot_match = re.search(r'rotate\(90\s+([-\d.]+)\s+([-\d.]+)\)', g_transform)
-            if pivot_match:
-                pivot_x, pivot_y = float(pivot_match.group(1)), float(pivot_match.group(2))
-                c.translate(pivot_x, pivot_y)
-                c.rotate(90)
-                c.translate(-pivot_x, -pivot_y)
-    draw_circles_with_gradients(c, root, all_gradients, ns)
+    draw_circles_with_gradients(c, root, all_gradients, ns, elem_ctm)
     draw_connection_paths(c, connection_path_ids, all_paths, root, ns)
     for circle_element in root.findall('.//svg:circle', ns):
+        _apply_ctm(c, elem_ctm, circle_element)
         final_fill_c, final_stroke_c, sw_c = _resolve_paint(circle_element)
         is_gradient_fill = isinstance(final_fill_c, str) and final_fill_c in all_gradients
         if is_gradient_fill and final_stroke_c is None:  # Gradient and no separate stroke: already handled by draw_circles_with_gradients
+            c.restoreState()
             continue
         cx_c = float(circle_element.get('cx', '0'));
         cy_c = float(circle_element.get('cy', '0'));
         r_c = float(circle_element.get('r', '0'))
         draw_circle(c, cx_c, cy_c, r_c, final_stroke_c, None if isinstance(final_fill_c, str) else final_fill_c, sw_c)
+        c.restoreState()
     for rect_element in root.findall('.//svg:rect', ns):
+        _apply_ctm(c, elem_ctm, rect_element)
         final_fill_r, final_stroke_r, sw_r = _resolve_paint(rect_element, default_fill = 'none', use_opacity = True)
         x_r = float(rect_element.get('x', '0')); y_r = float(rect_element.get('y', '0'))
         w_r = float(rect_element.get('width', '0')); h_r = float(rect_element.get('height', '0'))
@@ -857,7 +909,9 @@ def _render_svg_to_pdf_canvas(svg_data: str,
             c.restoreState()
         else:
             draw_rect(c, x_r, y_r, w_r, h_r, final_stroke_r, final_fill_r, sw_r)
+        c.restoreState()
     for ellipse_element in root.findall('.//svg:ellipse', ns):
+        _apply_ctm(c, elem_ctm, ellipse_element)
         final_fill_e, final_stroke_e, sw_e = _resolve_paint(ellipse_element, default_fill = 'black')
         cx_e = float(ellipse_element.get('cx', '0')); cy_e = float(ellipse_element.get('cy', '0'))
         rx_e = float(ellipse_element.get('rx', '0')); ry_e = float(ellipse_element.get('ry', '0'))
@@ -870,13 +924,15 @@ def _render_svg_to_pdf_canvas(svg_data: str,
             c.restoreState()
         else:
             draw_ellipse(c, cx_e, cy_e, rx_e, ry_e, final_stroke_e, final_fill_e, sw_e)
+        c.restoreState()
     for path_element in root.findall('.//svg:path', ns):
+        _apply_ctm(c, elem_ctm, path_element)
         is_in_defs_p = any(path_element in list(defs_el_iter) for defs_el_iter in root.findall('.//svg:defs', ns))
-        if is_in_defs_p: continue
         path_id_p = path_element.get('id', '')
-        if path_id_p in connection_path_ids: continue
         path_data_p = path_element.get('d', '')
-        if not path_data_p: continue
+        if is_in_defs_p or path_id_p in connection_path_ids or not path_data_p:
+            c.restoreState()
+            continue
         final_fill_p, final_stroke_p, sw_p = _resolve_paint(path_element)
         path_commands_p = parse_path(path_data_p)
         dash_p = _resolve_dash(path_element)
@@ -893,7 +949,8 @@ def _render_svg_to_pdf_canvas(svg_data: str,
             c.restoreState()
         else:
             draw_path(c, path_commands_p, final_stroke_p, final_fill_p, sw_p, dash_p)
-    process_text_elements(c, root, all_paths, ns, font_to_use)
+        c.restoreState()
+    process_text_elements(c, root, all_paths, ns, font_to_use, elem_ctm)
     return c
 
 
@@ -922,7 +979,8 @@ def convert_chem_to_file(svg_data: str, file_path: Union[str, Path, None] = None
     return None
 
 
-def convert_svg_to_pdf(svg_data: str, pdf_file_path: Union[str, Path], return_canvas: bool = False, chem: bool = False):
+def convert_svg_to_pdf(svg_data: str, pdf_file_path: Union[str, Path], return_canvas: bool = False, chem: bool = False,
+                       shadow: bool = False):
     if isinstance(svg_data, bytes):
         svg_data = svg_data.decode('utf-8')
     if chem:
@@ -932,7 +990,8 @@ def convert_svg_to_pdf(svg_data: str, pdf_file_path: Union[str, Path], return_ca
     aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
     if aria_label_match:
         alt_text_payload = {'alt_text': aria_label_match.group(1)}
-    canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_file_path, alt_text_info=alt_text_payload)
+    canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_file_path, alt_text_info = alt_text_payload)
+    canvas_obj.shadow = shadow
     if return_canvas:
         return canvas_obj
     else:
@@ -943,7 +1002,8 @@ def convert_svg_to_pdf(svg_data: str, pdf_file_path: Union[str, Path], return_ca
 def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = None,
                        output_width: Union[int, None] = None, output_height: Union[int, None] = None,
                        scale: Union[float, None] = None, return_bytes: bool = False,
-                       chem: bool = False):
+                       chem: bool = False, background: Union[tuple, None] = None,
+                       shadow: bool = False):
     if isinstance(svg_data, bytes):
         svg_data = svg_data.decode('utf-8')
     if chem:
@@ -953,6 +1013,7 @@ def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = No
     aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
     alt_text = aria_label_match.group(1) if aria_label_match else None
     canvas_obj = _render_svg_to_pdf_canvas(svg_data, None, alt_text_info = {'alt_text': alt_text} if alt_text else None)
+    canvas_obj.shadow = shadow
     page_width = canvas_obj.width if canvas_obj.width > 1e-3 else 1.0
     page_height = canvas_obj.height if canvas_obj.height > 1e-3 else 1.0
     if scale is not None:
@@ -965,7 +1026,7 @@ def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = No
         zoom_x = zoom_y = output_height / page_height
     else:
         zoom_x = zoom_y = 1.0
-    png = canvas_obj.to_png(zoom_x, zoom_y, texts = (('alt', alt_text),) if alt_text else ())
+    png = canvas_obj.to_png(zoom_x, zoom_y, background, texts = (('alt', alt_text),) if alt_text else ())
     if return_bytes:
         return png
     with open(str(png_file_path), 'wb') as fh:

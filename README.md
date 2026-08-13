@@ -83,7 +83,7 @@ Parameters:
 
 ## Dependencies
 
-- PyMuPDF (optional): For PNG conversion
+- `numpy`
 
 ## Contributing
 

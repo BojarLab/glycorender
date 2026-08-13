@@ -33,6 +33,7 @@ class TTF:
             if ol >= 90:
                 self.cap_height = struct.unpack('>h', d[o+88:o+90])[0] or self.ascent
         self.cmap = self._read_cmap()
+        self._kern_cache = None
         self._loca_cache = None
         self._outline_cache = {}
     def _read_cmap(self):
@@ -140,8 +141,19 @@ class TTF:
             return 0
         a = self.advances[gid] if gid < len(self.advances) else self.advances[-1]
         return a * 1000.0 / self.units_per_em
+    def kern(self, left, right):
+        """Horizontal kerning adjustment between two glyphs, in font units."""
+        if self._kern_cache is None:
+            try:
+                self._kern_cache = _read_kerning(self)
+            except Exception:
+                self._kern_cache = {}  # malformed GPOS: set text unkerned rather than fail
+        return self._kern_cache.get((left, right), 0)
     def string_width(self, text, size):
-        return sum(self.width(self.gid(ch)) for ch in text) * size / 1000.0
+        gids = [self.gid(ch) for ch in text]
+        total = sum(self.width(g) for g in gids)
+        total += sum(self.kern(a, b) for a, b in zip(gids, gids[1:])) * 1000.0 / self.units_per_em
+        return total * size / 1000.0
 
 
 def subset(font, gids):
@@ -275,3 +287,137 @@ def _contour_to_cmds(pts):
             i += 2
     cmds.append(('Z', ()))
     return cmds
+
+def _coverage(d, off):
+    """Coverage table -> {glyph: index}."""
+    fmt = struct.unpack('>H', d[off:off + 2])[0]
+    if fmt == 1:
+        n = struct.unpack('>H', d[off + 2:off + 4])[0]
+        return {g: i for i, g in enumerate(struct.unpack('>%dH' % n, d[off + 4:off + 4 + 2 * n]))}
+    n = struct.unpack('>H', d[off + 2:off + 4])[0]
+    out = {}
+    for i in range(n):
+        start, end, base = struct.unpack('>HHH', d[off + 4 + 6 * i:off + 10 + 6 * i])
+        for g in range(start, end + 1):
+            out[g] = base + g - start
+    return out
+
+def _class_def(d, off):
+    """ClassDef table -> {glyph: class}; unlisted glyphs are class 0."""
+    fmt = struct.unpack('>H', d[off:off + 2])[0]
+    out = {}
+    if fmt == 1:
+        start, n = struct.unpack('>HH', d[off + 2:off + 6])
+        for i, cls in enumerate(struct.unpack('>%dH' % n, d[off + 6:off + 6 + 2 * n])):
+            out[start + i] = cls
+    else:
+        n = struct.unpack('>H', d[off + 2:off + 4])[0]
+        for i in range(n):
+            lo, hi, cls = struct.unpack('>HHH', d[off + 4 + 6 * i:off + 10 + 6 * i])
+            for g in range(lo, hi + 1):
+                out[g] = cls
+    return out
+
+def _pair_subtable(d, st, pairs):
+    fmt, cov_off, vf1, vf2 = struct.unpack('>HHHH', d[st:st + 8])
+    if not vf1 & 0x0004:  # no x-advance on the first glyph: nothing that moves text along
+        return
+    size1 = 2 * bin(vf1).count('1')
+    size2 = 2 * bin(vf2).count('1')
+    skip = 2 * bin(vf1 & 0x0003).count('1')  # x/y placement precede x-advance in a ValueRecord
+    coverage = _coverage(d, st + cov_off)
+    if fmt == 1:
+        n = struct.unpack('>H', d[st + 8:st + 10])[0]
+        first = {i: g for g, i in coverage.items()}
+        for i in range(n):
+            ps = st + struct.unpack('>H', d[st + 10 + 2 * i:st + 12 + 2 * i])[0]
+            cnt = struct.unpack('>H', d[ps:ps + 2])[0]
+            for k in range(cnt):
+                rec = ps + 2 + k * (2 + size1 + size2)
+                second = struct.unpack('>H', d[rec:rec + 2])[0]
+                adj = struct.unpack('>h', d[rec + 2 + skip:rec + 4 + skip])[0]
+                if adj:
+                    pairs[(first[i], second)] = adj
+    elif fmt == 2:
+        cd1_off, cd2_off, n1, n2 = struct.unpack('>HHHH', d[st + 8:st + 16])
+        cd1, cd2 = _class_def(d, st + cd1_off), _class_def(d, st + cd2_off)
+        by_class1, by_class2 = {}, {}
+        for g in coverage:
+            by_class1.setdefault(cd1.get(g, 0), []).append(g)
+        for g, cls in cd2.items():
+            by_class2.setdefault(cls, []).append(g)
+        rec_size = size1 + size2
+        for c1 in range(n1):
+            if c1 not in by_class1:
+                continue
+            for c2 in range(n2):
+                if c2 not in by_class2:
+                    continue
+                rec = st + 16 + (c1 * n2 + c2) * rec_size
+                adj = struct.unpack('>h', d[rec + skip:rec + 2 + skip])[0]
+                if not adj:
+                    continue
+                if len(pairs) > 200000:  # pathological font: stop rather than blow up memory
+                    return
+                for g1 in by_class1[c1]:
+                    for g2 in by_class2[c2]:
+                        pairs[(g1, g2)] = adj
+
+def _legacy_kern(font):
+    """Pairs from the old TrueType 'kern' table, which pre-OpenType fonts use instead of GPOS."""
+    d = font.data
+    off, _ = font.tables['kern']
+    n_tables = struct.unpack('>H', d[off + 2:off + 4])[0]
+    pos = off + 4
+    pairs = {}
+    for _ in range(n_tables):
+        length, coverage = struct.unpack('>HH', d[pos + 2:pos + 6])
+        if coverage & 0x0001 and not coverage & 0x0006 and (
+                coverage >> 8) == 0:  # horizontal, real kerning, format 0
+            n = struct.unpack('>H', d[pos + 6:pos + 8])[0]
+            for i in range(n):
+                rec = pos + 14 + 6 * i
+                left, right, value = struct.unpack('>HHh', d[rec:rec + 6])
+                if value:
+                    pairs[(left, right)] = value
+        pos += length or 6
+    return pairs
+
+def _read_kerning(font):
+    """Pair adjustments from the GPOS 'kern' feature -> {(left, right): x-advance in font units}."""
+    d = font.data
+    if 'GPOS' not in font.tables:
+        return _legacy_kern(font) if 'kern' in font.tables else {}
+    base = font.tables['GPOS'][0]
+    _script_off, feature_off, lookup_off = [base + v for v in struct.unpack('>HHH', d[base + 4:base + 10])]
+    wanted = set()
+    n_feat = struct.unpack('>H', d[feature_off:feature_off + 2])[0]
+    for i in range(n_feat):
+        rec = feature_off + 2 + 6 * i
+        if d[rec:rec + 4] != b'kern':
+            continue
+        f = feature_off + struct.unpack('>H', d[rec + 4:rec + 6])[0]
+        n_lu = struct.unpack('>H', d[f + 2:f + 4])[0]
+        wanted.update(struct.unpack('>%dH' % n_lu, d[f + 4:f + 4 + 2 * n_lu]))
+    if not wanted:
+        return _legacy_kern(font) if 'kern' in font.tables else {}
+    n_lookups = struct.unpack('>H', d[lookup_off:lookup_off + 2])[0]
+    pairs = {}
+    for idx in sorted(wanted):
+        if idx >= n_lookups:
+            continue
+        lo = lookup_off + struct.unpack('>H', d[lookup_off + 2 + 2 * idx:lookup_off + 4 + 2 * idx])[0]
+        kind, _flag, n_sub = struct.unpack('>HHH', d[lo:lo + 6])
+        for j in range(n_sub):
+            st = lo + struct.unpack('>H', d[lo + 6 + 2 * j:lo + 8 + 2 * j])[0]
+            if kind == 9:  # extension lookup: hop to the real subtable
+                real, delta = struct.unpack('>HI', d[st + 2:st + 8])
+                if real != 2:
+                    continue
+                st += delta
+            elif kind != 2:
+                continue
+            _pair_subtable(d, st, pairs)
+    if not pairs and 'kern' in font.tables:  # GPOS present but no usable kern feature
+        return _legacy_kern(font)
+    return pairs
