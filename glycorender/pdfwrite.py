@@ -136,7 +136,7 @@ _FONT_DIRS = [os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'Fonts')
 
 class TTFont:
     def __init__(self, name, filename):
-        """"Font class."""
+        """Font class."""
         self.name = name
         if not os.path.isfile(filename):  # bare filename: search the platform font directories, as reportlab does
             for root in _FONT_DIRS:
