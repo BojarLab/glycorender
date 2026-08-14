@@ -263,8 +263,8 @@ def _glyph_paths(op, ctm):
 
 
 class Image:
-    """Premultiplied float RGBA accumulation buffer."""
     def __init__(self, w, h):
+        """Premultiplied float RGBA accumulation buffer."""
         self.w, self.h = w, h
         self.buf = np.zeros((h, w, 4), dtype = np.float64)
     def paint(self, edges, rgb, alpha, even_odd = False, box = None):

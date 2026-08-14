@@ -1,7 +1,9 @@
 """Minimal TrueType reader: enough for PDF embedding and text measurement."""
 import struct
+
 class TTF:
     def __init__(self, path):
+        """Font class."""
         self.path = path
         with open(path, 'rb') as fh:
             self.data = fh.read()

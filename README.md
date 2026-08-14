@@ -57,16 +57,8 @@ GlycoRender is specifically designed for:
 ## API Reference
 
 ### `convert_svg_to_pdf(svg_data, pdf_file_path)`
-
-Converts SVG data to a PDF file.
-
-Parameters:
-- `svg_data` (str or bytes): SVG content either as a string or bytes
-- `pdf_file_path` (str): Path where the output PDF should be saved
-
 ### `convert_svg_to_png(svg_data, png_file_path)`
-
-Converts SVG data to a PNG file.
+Converts SVG data to a PDF/PNG file.
 
 Parameters:
 - `svg_data` (str or bytes): SVG content either as a string or bytes

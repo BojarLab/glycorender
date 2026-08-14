@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from . import pdfwrite as canvas
 from .pdfwrite import pdfmetrics
 
+_ENTITY_DECL = re.compile(r'<!ENTITY', re.I)
 _NUM = re.compile(r'[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?')
 _CMD = re.compile(r'([MmLlHhVvCcSsQqTtAaZz])')
 _TRANSFORM = re.compile(r'(matrix|translate|scale|rotate|skewX|skewY)\s*\(([^)]*)\)')
@@ -23,6 +24,19 @@ _INHERIT = ('fill', 'stroke', 'stroke-width', 'opacity', 'fill-opacity', 'stroke
             'font-size', 'font-weight', 'text-anchor')
 _CAP = {'butt': 0, 'round': 1, 'square': 2}
 _JOIN = {'miter': 0, 'round': 1, 'bevel': 2}
+
+
+def parse_xml(text):
+    """Parse an SVG document, refusing entity declarations.
+
+    ElementTree already ignores external entities, but it does expand internal ones, which is
+    the billion-laughs denial of service. No SVG glycorender consumes declares any.
+    """
+    if isinstance(text, bytes):
+        text = text.decode('utf-8')
+    if _ENTITY_DECL.search(text):
+        raise ValueError('SVG declares XML entities, which glycorender does not accept')
+    return ET.fromstring(text)
 
 
 def _tag(el):
@@ -257,7 +271,7 @@ class _Renderer:
         self.c.state['clip'] = clip
         p = self.c.beginPath()
         for seg in path:
-            {'m': p.moveTo, 'l': p.lineTo, 'c': p.curveTo, 'h': lambda: p.close()}[seg[0]](*seg[1:])
+            {'m': p.moveTo, 'l': p.lineTo, 'c': p.curveTo, 'h': p.close}[seg[0]](*seg[1:])
         if fill is not None:
             self.c.setFillColorRGB(*fill, alpha = alpha * _num(style.get('fill-opacity'), 1.0))
             if grad: self.c.setFillGradient(*grad)
@@ -372,8 +386,7 @@ def _viewbox(root, width=None, height=None):
 
 def build(svg_data, target, font=('Comfortaa', 'Comfortaa-Bold')):
     """Render an SVG document into a pdfwrite Canvas in document order."""
-    if isinstance(svg_data, bytes): svg_data = svg_data.decode('utf-8')
-    root = ET.fromstring(svg_data)
+    root = parse_xml(svg_data)
     vb = [float(v) for v in _NUM.findall(root.get('viewBox', ''))]
     width = _num(root.get('width'), vb[2] if len(vb) == 4 else 100.0)
     height = _num(root.get('height'), vb[3] if len(vb) == 4 else 100.0)

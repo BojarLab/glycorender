@@ -118,6 +118,7 @@ def _esc(b):
 
 class _Registry:
     def __init__(self):
+        """Registers fonts."""
         self.fonts = {}
     def registerFont(self, font):
         self.fonts[font.name] = font
@@ -135,6 +136,7 @@ _FONT_DIRS = [os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'Fonts')
 
 class TTFont:
     def __init__(self, name, filename):
+        """"Font class."""
         self.name = name
         if not os.path.isfile(filename):  # bare filename: search the platform font directories, as reportlab does
             for root in _FONT_DIRS:
@@ -155,6 +157,7 @@ pdfmetrics = _Registry()
 
 class Path:
     def __init__(self):
+        """A drawn path."""
         self.ops = []
     def moveTo(self, x, y):
         self.ops.append(('m', x, y))
@@ -170,8 +173,8 @@ _PDF_OP = {'m': '%s %s m', 'l': '%s %s l', 'c': '%s %s %s %s %s %s c', 'h': 'h'}
 
 
 class Canvas:
-    """Records a resolved display list; every op carries its own CTM and graphics state."""
     def __init__(self, target, pagesize=(595.27, 841.89)):
+        """Records a resolved display list; every op carries its own CTM and graphics state."""
         self.target = target
         self.width, self.height = pagesize
         self.ops = []
@@ -448,6 +451,7 @@ class Canvas:
 
 class _Writer:
     def __init__(self):
+        """Writes out the pdf."""
         self.objs = []
     def reserve(self):
         self.objs.append(None)

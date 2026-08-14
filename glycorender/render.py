@@ -1,8 +1,8 @@
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="importlib._bootstrap")
-import xml.etree.ElementTree as ET
 import re
 import math
+import struct
 from pathlib import Path
 import glycorender.pdfwrite as canvas
 import glycorender.svgin as svgin
@@ -581,7 +581,7 @@ def extract_defs(root, ns, elem_ctm = None):
                                           'units': radial_gradient.get('gradientUnits', 'objectBoundingBox')}
     in_defs = {id(node) for defs_node_check in root.findall('.//svg:defs', ns) for node in defs_node_check.iter()}
     for path in root.findall('.//svg:path', ns):  # Connection path logic
-        # RDKit bonds usually defined by class, e.g. "bond-0" and explicit style.
+        # RDKit bonds usually defined by class, e.g., "bond-0" and explicit style.
         if 'snfg-linkage' in (path.get('class') or '') or path.get('stroke-width') == '4.0':
             if id(path) in in_defs: continue
             path_id = path.get('id') or f"connection_{len(all_paths)}"
@@ -629,10 +629,9 @@ def _apply_ctm(c, elem_ctm, el):
 
 
 def element_transforms(root):
-    """Accumulated transform for every element, so nested <g transform=...> is honoured.
+    """Accumulated transform for every element, so nested <g transform=...> is honored.
 
-    glycowork wraps brackets and Domon-Costello Z/Y markers in rotated groups; without this
-    their children were drawn unrotated.
+    glycowork wraps brackets and Domon-Costello Z/Y markers in rotated groups.
     """
     out, stack = {}, [(root, _IDENTITY)]
     while stack:
@@ -833,13 +832,13 @@ def register_bundled_fonts():
     # Try to register Century Gothic with various filenames
     for regular_name, bold_name in century_gothic_variations:
         try:
-            # Try with just the filename (reportlab will find it in system fonts)
+            # Try with just the filename
             pdfmetrics.registerFont(TTFont('CenturyGothic', regular_name))
             pdfmetrics.registerFont(TTFont('CenturyGothic-Bold', bold_name))
             pdfmetrics.registerFontFamily('CenturyGothic', normal='CenturyGothic', bold='CenturyGothic-Bold')
             return 'CenturyGothic'
-        except Exception:
-            continue  # try the next filename variation
+        except (OSError, LookupError, ValueError, struct.error):
+            continue  # this Century Gothic filename is absent or unreadable; try the next
     font_name = 'Comfortaa'
     # Get the location of this module file and navigate to fonts directory
     this_dir = Path(__file__).parent / 'fonts'
@@ -867,7 +866,7 @@ def _render_svg_to_pdf_canvas(svg_data: str,
         aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
         if aria_label_match:
             current_alt_text = aria_label_match.group(1)
-    root = ET.fromstring(svg_data)
+    root = svgin.parse_xml(svg_data)
     ns = {'svg': 'http://www.w3.org/2000/svg', 'xlink': 'http://www.w3.org/1999/xlink'}
     width, height, vb_x, vb_y, scale_x, scale_y = parse_svg_dimensions(root)
     c = canvas.Canvas(pdf_target, pagesize=(width * mm, height * mm) if width <= 20 and height <=20 else (width, height))
