@@ -98,6 +98,32 @@ def shadow_params(ops, shadow):
     return spec
 
 
+def sticker_params(ops, sticker):
+    """Turn `sticker=True` into a die-cut spec: how far the cut line sits outside the ink, in points.
+
+    `edge` adds a second, wider band underneath in `edge_color`, i.e. the thin keyline printed
+    around a real die-cut sticker; `shadow` lets the cut silhouette cast the drop shadow itself.
+    """
+    if not sticker:
+        return None
+    spec = dict(sticker) if isinstance(sticker, dict) else {}
+    sizes = []
+    for op in ops:
+        if op['kind'] != 'path' or not (op['fill'] and op['stroke']):
+            continue
+        xs = [seg[i] for seg in op['path'] for i in range(1, len(seg), 2)]
+        ys = [seg[i] for seg in op['path'] for i in range(2, len(seg), 2)]
+        if xs:
+            sizes.append(max(max(xs) - min(xs), max(ys) - min(ys)))
+    unit = sorted(sizes)[len(sizes) // 2] if sizes else 50.0
+    spec.setdefault('width', 0.18 * unit)
+    spec.setdefault('color', (1.0, 1.0, 1.0))
+    spec.setdefault('edge', 0.0)
+    spec.setdefault('edge_color', (0.110, 0.098, 0.090))
+    spec.setdefault('shadow', True)
+    return spec
+
+
 def _grad_index(shadings, grad, bbox, alpha):
     key = (grad, bbox, round(alpha, 4))
     if key not in shadings:
@@ -188,6 +214,7 @@ class Canvas:
         self._font = None
         self._size = 0
         self.shadow = None
+        self.sticker = None
 
     # --- state ---
     def saveState(self):
@@ -278,15 +305,20 @@ class Canvas:
         self.info['Keywords'] = v
 
     # --- backends ---
+    def _effects(self):
+        """Resolved (shadow, sticker) specs; a die cut casts the shadow itself unless told otherwise."""
+        sticker = sticker_params(self.ops, self.sticker)
+        return shadow_params(self.ops, self.shadow or (sticker['shadow'] if sticker else False)), sticker
+
     def to_png(self, scale_x = 1.0, scale_y = 1.0, background = None, texts = ()):
         from . import raster
+        shadow, sticker = self._effects()
         return raster.encode_png(
-            raster.render(self.ops, self.width, self.height, scale_x, scale_y, background,
-                          shadow_params(self.ops, self.shadow)), texts)
+            raster.render(self.ops, self.width, self.height, scale_x, scale_y, background, shadow, sticker), texts)
 
     def to_svg(self):
         from .svgout import emit
-        return emit(self.ops, self.width, self.height, shadow_params(self.ops, self.shadow))
+        return emit(self.ops, self.width, self.height, *self._effects())
 
     # --- PDF output ---
     def _path_bbox(self, path, grad):
@@ -346,11 +378,38 @@ class Canvas:
             buf.append('Q')
         return '\n'.join(buf)
 
-    def _shadow_object(self, out):
+    def _sticker_content(self, alphas, spec):
+        """The die-cut layer: every shape re-emitted in flat color, fattened by a round stroke."""
+        buf = []
+        layers = [(spec['width'] + spec['edge'], spec['edge_color'])] if spec['edge'] > 0 else []
+        for grow, color in layers + [(spec['width'], spec['color'])]:
+            for op in self.ops:
+                if op['kind'] == 'path' and not (op['fill'] or op['stroke']): continue
+                buf.append('q')
+                cur = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                for box, ctm in op.get('clip') or ():
+                    buf.append('%s %s %s %s %s %s cm' % tuple(_fmt(v) for v in _mul(ctm, _inv(cur))))
+                    buf.append('%s %s %s %s re W n' % tuple(_fmt(v) for v in box))
+                    cur = ctm
+                buf.append('%s %s %s %s %s %s cm' % tuple(_fmt(v) for v in _mul(op['ctm'], _inv(cur))))
+                buf.append('/%s gs /%s gs' % (_alpha_name(alphas, 1.0, False), _alpha_name(alphas, 1.0, True)))
+                buf.append('%s %s %s rg %s %s %s RG' % (tuple(_fmt(v) for v in color) * 2))
+                is_path = op['kind'] == 'path'
+                buf.append('%s w 1 J 1 j' % _fmt((op['line_width'] if is_path and op['stroke'] else 0.0) + 2 * grow))
+                if is_path:
+                    buf.extend(_PDF_OP[seg[0]] % tuple(_fmt(v) for v in seg[1:]) if len(seg) > 1 else _PDF_OP[seg[0]]
+                               for seg in op['path'])
+                    buf.append(('B*' if op.get('even_odd') else 'B') if op['fill'] else 'S')
+                else:
+                    buf.append('BT /%s %s Tf %s Tc 2 Tr 1 0 0 1 %s %s Tm %s TJ ET'
+                               % (op['font'], _fmt(op['size']), _fmt(op['char_space']), _fmt(op['x']), _fmt(op['y']),
+                                  _kerned_run(op['ttf'], op['text'])))
+                buf.append('Q')
+        return '\n'.join(buf)
+    def _shadow_object(self, out, spec, sticker):
         """Flat shadow color behind a grayscale soft mask; a blurred shadow cannot stay vector."""
         from . import raster
-        spec = shadow_params(self.ops, self.shadow)
-        w, h, mask = raster.shadow_alpha(self.ops, self.width, self.height, spec)
+        w, h, mask = raster.shadow_alpha(self.ops, self.width, self.height, spec, sticker)
         packed = zlib.compress(mask.tobytes(), 9)
         smask = out.add(('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray '
                          '/BitsPerComponent 8 /Filter /FlateDecode /Length %d >>\nstream\n'
@@ -416,9 +475,12 @@ class Canvas:
         out = _Writer()
         alphas, shadings = {}, {}
         body = self._content(alphas, shadings)
+        shadow, sticker = self._effects()
+        if sticker:
+            body = self._sticker_content(alphas, sticker) + '\n' + body
         xobj = ''
-        if self.shadow:
-            xobj = '/Shadow %d 0 R' % self._shadow_object(out)
+        if shadow:
+            xobj = '/Shadow %d 0 R' % self._shadow_object(out, shadow, sticker)
             body = 'q %s 0 0 %s 0 0 cm /Shadow Do Q\n' % (_fmt(self.width), _fmt(self.height)) + body
         content = zlib.compress(body.encode('latin-1'), 9)
         stream = out.add(b'<< /Length %d /Filter /FlateDecode >>\nstream\n' % len(content) + content + b'\nendstream')

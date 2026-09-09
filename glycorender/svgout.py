@@ -61,16 +61,13 @@ def _filter(shadow, name):
                            _fmt(shadow['blur']), _hex(shadow['color']), _fmt(shadow['alpha'])))
 
 
-def emit(ops, width, height, shadow = None):
-    body, grads = [], {}
+def emit(ops, width, height, shadow = None, sticker = None):
+    body, grads, shapes = [], {}, []
     prefix = 'grad%d_' % next(_DOC)
     for op in ops:
         if op['kind'] == 'path':
             if not (op['fill'] or op['stroke']): continue
-            el = _element(_d(op['path']), op, op['fill'], op['stroke'], grads, prefix)
-            if shadow and op['fill'] and op['stroke']:
-                el = el.replace('<path ', '<path filter="url(#%sshadow)" ' % prefix, 1)
-            body.append(el)
+            shapes.append((op, _d(op['path'])))
         else:
             ttf, pen, segs = op['ttf'], op['x'], []
             gids = [ttf.gid(ch) for ch in op['text']]
@@ -84,7 +81,27 @@ def emit(ops, width, height, shadow = None):
                 pen += ttf.width(gid) * op['size'] / 1000.0 + op['char_space']
                 if n + 1 < len(gids):
                     pen += ttf.kern(gid, gids[n + 1]) * k
-            if segs: body.append(_element(' '.join(segs), op, True, False))
+            if segs: shapes.append((op, ' '.join(segs)))
+    if sticker:
+        layers = [(sticker['width'] + sticker['edge'], sticker['edge_color'])] if sticker['edge'] > 0 else []
+        if shadow: body.append(
+            '<g filter="url(#%sshadow)">' % prefix)  # one shadow for the whole cut, not one per piece
+        for grow, color in layers + [(sticker['width'], sticker['color'])]:
+            for op, d in shapes:
+                is_path = op['kind'] == 'path'
+                cut = dict(op, fill_rgb = color, stroke_rgb = color, fill_alpha = 1.0, stroke_alpha = 1.0,
+                           fill_grad = None, dash = None, cap = 1, join = 1,
+                           line_width = (op['line_width'] if is_path and op['stroke'] else 0.0) + 2 * grow)
+                body.append(_element(d, cut, not is_path or op['fill'], True))
+        if shadow: body.append('</g>')
+    for op, d in shapes:
+        if op['kind'] == 'path':
+            el = _element(d, op, op['fill'], op['stroke'], grads, prefix)
+            if shadow and not sticker and op['fill'] and op['stroke']:
+                el = el.replace('<path ', '<path filter="url(#%sshadow)" ' % prefix, 1)
+            body.append(el)
+        else:
+            body.append(_element(d, op, True, False))
     defs, entries = '', []
     if grads:
         for (kind, geo, stops), name in grads.items():

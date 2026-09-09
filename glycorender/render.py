@@ -980,7 +980,7 @@ def convert_chem_to_file(svg_data: str, file_path: Union[str, Path, None] = None
 
 
 def convert_svg_to_pdf(svg_data: str, pdf_file_path: Union[str, Path], return_canvas: bool = False, chem: bool = False,
-                       shadow: bool = False):
+                       shadow: bool = False, sticker: bool = False):
     if isinstance(svg_data, bytes):
         svg_data = svg_data.decode('utf-8')
     if chem:
@@ -992,6 +992,7 @@ def convert_svg_to_pdf(svg_data: str, pdf_file_path: Union[str, Path], return_ca
         alt_text_payload = {'alt_text': aria_label_match.group(1)}
     canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_file_path, alt_text_info = alt_text_payload)
     canvas_obj.shadow = shadow
+    canvas_obj.sticker = sticker
     if return_canvas:
         return canvas_obj
     else:
@@ -1003,7 +1004,7 @@ def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = No
                        output_width: Union[int, None] = None, output_height: Union[int, None] = None,
                        scale: Union[float, None] = None, return_bytes: bool = False,
                        chem: bool = False, background: Union[tuple, None] = None,
-                       shadow: bool = False):
+                       shadow: bool = False, sticker: bool = False):
     if isinstance(svg_data, bytes):
         svg_data = svg_data.decode('utf-8')
     if chem:
@@ -1014,6 +1015,7 @@ def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = No
     alt_text = aria_label_match.group(1) if aria_label_match else None
     canvas_obj = _render_svg_to_pdf_canvas(svg_data, None, alt_text_info = {'alt_text': alt_text} if alt_text else None)
     canvas_obj.shadow = shadow
+    canvas_obj.sticker = sticker
     page_width = canvas_obj.width if canvas_obj.width > 1e-3 else 1.0
     page_height = canvas_obj.height if canvas_obj.height > 1e-3 else 1.0
     if scale is not None:
@@ -1034,9 +1036,12 @@ def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = No
     return None
 
 
-def pdf_to_svg_bytes(svg_string):
+def pdf_to_svg_bytes(svg_string, shadow: bool = False, sticker: bool = False):
     """Round-trip an SNFG SVG through the glycorender display list so the browser sees the PDF geometry."""
-    return _render_svg_to_pdf_canvas(svg_string, None, alt_text_info=None).to_svg()
+    canvas_obj = _render_svg_to_pdf_canvas(svg_string, None, alt_text_info=None)
+    canvas_obj.shadow = shadow
+    canvas_obj.sticker = sticker
+    return canvas_obj.to_svg()
 
 
 def simple_svg_to_pdf(svg_data: str, pdf_path: Union[str, Path]) -> None:

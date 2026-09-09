@@ -353,48 +353,78 @@ def _box_blur(a, radius):
     return a
 
 
-def _shadow_mask(ops, w, h, flip, dx, dy):
-    """Alpha coverage of every filled-and-stroked shape (i.e., the SNFG symbols), offset."""
-    layer = Image(w, h)
+def _ink_mask(ops, w, h, flip, dx = 0.0, dy = 0.0, grow = 0.0, symbols_only = True):
+    """Union coverage of the ink, offset by (dx, dy) and grown outward by `grow` device units.
+
+    Coverage is unioned with a max rather than composited, so the seam where two grown shapes
+    overlap does not show up as a lighter line in the die-cut silhouette.
+    """
+    mask = np.zeros((h, w), dtype = np.float64)
     shift = _mul(flip, (1.0, 0.0, 0.0, 1.0, dx, dy))
+    def add(edges, even_odd = False):
+        if not len(edges): return
+        x0 = max(0, int(math.floor(edges[:, [0, 2]].min())))
+        x1 = min(w, int(math.ceil(edges[:, [0, 2]].max())) + 1)
+        y0 = max(0, int(math.floor(edges[:, [1, 3]].min())))
+        y1 = min(h, int(math.ceil(edges[:, [1, 3]].max())) + 1)
+        if x1 <= x0 or y1 <= y0: return
+        sub = mask[y0:y1, x0:x1]
+        np.maximum(sub, coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd), out = sub)
     for op in ops:
-        if op['kind'] != 'path' or not (op['fill'] and op['stroke']):
-            continue
         ctm = _mul(op['ctm'], shift)
         if _inv(ctm) is None: continue
-        subs = flatten(op['path'], ctm)
-        if not subs: continue
-        layer.paint(_edges(subs, True), (0.0, 0.0, 0.0), 1.0, op.get('even_odd', False))
         sc = math.sqrt(abs(ctm[0] * ctm[3] - ctm[1] * ctm[2])) or 1.0
-        layer.paint(_edges(stroke_polys(subs, op['line_width'] * sc, op['cap'], op['join']), True),
-                    (0.0, 0.0, 0.0), 1.0)
-    return layer.buf[:, :, 3]
+        if op['kind'] == 'path':
+            if not (op['fill'] and op['stroke'] if symbols_only else op['fill'] or op['stroke']): continue
+            subs = flatten(op['path'], ctm)
+            if not subs: continue
+            if op['fill']: add(_edges(subs, True), op.get('even_odd', False))
+            width = (op['line_width'] * sc if op['stroke'] else 0.0) + 2.0 * grow
+            if width > 0:
+                add(_edges(stroke_polys(subs, width, 1 if grow else op['cap'], 1 if grow else op['join']), True))
+        elif not symbols_only:
+            subs = []
+            for cmds, gctm in _glyph_paths(op, ctm):
+                subs.extend(flatten(cmds, gctm))
+            if not subs: continue
+            add(_edges(subs, True))
+            if grow > 0: add(_edges(stroke_polys(subs, 2.0 * grow, 1, 1), True))
+    return mask
 
 
-def shadow_alpha(ops, width, height, shadow, dpi = 150.0):
+def shadow_alpha(ops, width, height, shadow, sticker = None, dpi = 150.0):
     """Blurred shadow coverage as a uint8 mask, for use as a PDF luminosity soft mask."""
     sc = dpi / 72.0
     w, h = max(1, int(round(width * sc))), max(1, int(round(height * sc)))
     flip = (sc, 0.0, 0.0, -sc, 0.0, float(h))
-    mask = _box_blur(_shadow_mask(ops, w, h, flip, shadow['dx'] * sc, shadow['dy'] * sc),
+    grow = ((sticker['width'] + sticker['edge']) * sc) if sticker else 0.0
+    mask = _box_blur(_ink_mask(ops, w, h, flip, shadow['dx'] * sc, shadow['dy'] * sc, grow, not sticker),
                      max(1, int(round(shadow['blur'] * sc))))
     a = np.clip(mask * shadow['alpha'], 0.0, 1.0)
     return w, h, np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, shadow = None):
+def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, shadow = None, sticker = None):
     """Rasterize a pdfwrite display list; `background` None keeps alpha. PDF y-up is flipped to image y-down here."""
     w = max(1, int(round(width * scale_x)))
     h = max(1, int(round(height * scale_y)))
     flip = (scale_x, 0.0, 0.0, -scale_y, 0.0, float(h))
     img = Image(w, h)
+    sc = (scale_x + scale_y) / 2.0
     if shadow:
-        sc = (scale_x + scale_y) / 2.0
-        mask = _box_blur(_shadow_mask(ops, w, h, flip, shadow['dx'] * sc, shadow['dy'] * sc),
+        grow = ((sticker['width'] + sticker['edge']) * sc) if sticker else 0.0
+        mask = _box_blur(_ink_mask(ops, w, h, flip, shadow['dx'] * sc, shadow['dy'] * sc, grow, not sticker),
                          max(1, int(round(shadow['blur'] * sc))))
         a = np.clip(mask * shadow['alpha'], 0.0, 1.0)
         img.buf[:, :, :3] = np.asarray(shadow['color'], dtype = np.float64) * a[:, :, None]
         img.buf[:, :, 3] = a
+    if sticker:
+        layers = [(sticker['width'] + sticker['edge'], sticker['edge_color'])] if sticker['edge'] > 0 else []
+        for grow, color in layers + [(sticker['width'], sticker['color'])]:
+            a = np.clip(_ink_mask(ops, w, h, flip, 0.0, 0.0, grow * sc, False), 0.0, 1.0)
+            a3 = a[:, :, None]
+            img.buf[:, :, :3] = img.buf[:, :, :3] * (1 - a3) + np.asarray(color, dtype = np.float64) * a3
+            img.buf[:, :, 3] = img.buf[:, :, 3] * (1 - a) + a
     for op in ops:
         ctm = _mul(op['ctm'], flip)
         if _inv(ctm) is None: continue
