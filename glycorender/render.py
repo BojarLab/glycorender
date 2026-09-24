@@ -333,49 +333,35 @@ def draw_text_on_path(c, text, path_points, offset_percent, font_name, font_size
     total_length = path_length(path_points)
     target_length = total_length * (offset_percent / 100.0)
     x, y, angle = point_at_length(path_points, target_length)
-    if x == 0 and y == 0 and angle == 0:
-        return
+    actual_font = font_name + '-Bold' if is_bold else font_name
+    # Ring labels ('f', 'Df', 'Lf', ...) sit centered on the symbol, and their furanose f gets a faked italic, since the label font ships none
+    italic_f = text.endswith('f') and abs(offset_y - 0.5 * font_size) < 0.01
+    char_space = 0 if italic_f else 0.05 * font_size  # tracking scales with the label, so a larger dim does not squeeze it
     c.saveState()
     c.translate(x, y)
     c.rotate(angle)
+    if c.state['ctm'][
+        0] < -1e-6:  # the carrier runs right-to-left on the page (vertical mode turns some bonds that way), so turn the label upright on the same side of the line
+        c.rotate(180)
+        ttf = pdfmetrics.fonts[actual_font].ttf
+        offset_y = ttf.cap_height / ttf.units_per_em * font_size - offset_y
     if offset_y:
         c.translate(0, offset_y)
-    if text_anchor == 'middle':
-        text_width = pdfmetrics.stringWidth(text, font_name, font_size)
-        c.translate(-text_width/2, 0)
-    elif text_anchor == 'end':
-        text_width = pdfmetrics.stringWidth(text, font_name, font_size)
-        c.translate(-text_width, 0)
+    if text_anchor in ('middle', 'end'):
+        text_width = pdfmetrics.stringWidth(text, actual_font, font_size) + char_space * (len(text) - 1)
+        c.translate(-text_width / (2 if text_anchor == 'middle' else 1), 0)
     if fill_color:
         c.setFillColorRGB(*fill_color)
-    # Special handling for 'Df'
-    if text == 'Df' and abs(offset_y - 0.5 * font_size) < 0.01:
-        # Draw 'D' normally
-        actual_font = font_name + '-Bold' if is_bold else font_name
-        c.setFont(actual_font, font_size)
-        c.scale(1, -1)
-        d_width = pdfmetrics.stringWidth('D', actual_font, font_size)
-        c.drawString(0, 0, 'D')
-        # Draw 'f' with italic simulation
-        c.saveState()
-        c.translate(d_width, 0)
-        c.transform(1, 0, 0.3, 1, -0.3 * font_size/2, 0)  # Positive skew for forward lean
+    c.setFont(actual_font, font_size)
+    c.scale(1, -1)
+    if italic_f:
+        c.drawString(0, 0, text[:-1])
+        c.translate(pdfmetrics.stringWidth(text[:-1], actual_font, font_size), 0)
+        c.transform(1, 0, 0.3, 1, -0.3 * font_size / 2 if text == 'f' else 0,
+                    0)  # Positive skew for forward lean; only a lone f is pulled back to stay centred, after a letter it would collide
         c.drawString(0, 0, 'f')
-        c.restoreState()
-    # Special handling for just 'f'
-    elif (text == 'f') and abs(offset_y - 0.5 * font_size) < 0.01:
-        # Simulate italic with proper forward slant
-        actual_font = font_name + '-Bold' if is_bold else font_name
-        c.setFont(actual_font, font_size)
-        c.scale(1, -1)
-        c.transform(1, 0, 0.3, 1, -0.3 * font_size/2, 0)  # Positive skew for forward lean
-        c.drawString(0, 0, text)
     else:
-        # Normal text rendering
-        actual_font = font_name + '-Bold' if is_bold else font_name
-        c.setFont(actual_font, font_size)
-        c.scale(1, -1)
-        c.drawString(0, 0, text, charSpace=1.0)
+        c.drawString(0, 0, text, charSpace = char_space)
     c.restoreState()
 
 

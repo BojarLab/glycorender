@@ -314,7 +314,8 @@ class Canvas:
         from . import raster
         shadow, sticker = self._effects()
         return raster.encode_png(
-            raster.render(self.ops, self.width, self.height, scale_x, scale_y, background, shadow, sticker), texts)
+            raster.render(self.ops, self.width, self.height, scale_x, scale_y, background, shadow, sticker), texts,
+            (72.0 * scale_x, 72.0 * scale_y))
 
     def to_svg(self):
         from .svgout import emit

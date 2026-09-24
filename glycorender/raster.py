@@ -117,8 +117,9 @@ def _norm(poly):
     return poly if area >= 0 else poly[::-1]
 
 
-def _arc(cx, cy, r, n = 16):
-    t = np.linspace(0, 2 * math.pi, n, endpoint = False)
+def _arc(cx, cy, r):
+    t = np.linspace(0, 2 * math.pi, max(16, int(7 * math.sqrt(r))),
+                    endpoint = False)  # keeps the facet sagitta under 0.1 px at any zoom
     return list(zip((cx + r * np.cos(t)).tolist(), (cy + r * np.sin(t)).tolist()))
 
 
@@ -323,8 +324,8 @@ class Image:
         return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-def encode_png(arr, texts = ()):
-    """uint8 (H,W,3) or (H,W,4) -> PNG bytes, with optional (keyword, value) tEXt chunks."""
+def encode_png(arr, texts = (), dpi = None):
+    """uint8 (H,W,3) or (H,W,4) -> PNG bytes, with optional (keyword, value) tEXt chunks and (x, y) resolution."""
     if arr.shape[2] == 4 and arr[:, :, 3].min() == 255:
         arr = arr[:, :, :3]  # nothing is transparent, so don't pay for an alpha channel
     h, w = arr.shape[:2]
@@ -332,6 +333,8 @@ def encode_png(arr, texts = ()):
     def chunk(tag, body):
         return struct.pack('>I', len(body)) + tag + body + struct.pack('>I', zlib.crc32(tag + body) & 0xFFFFFFFF)
     out = [b'\x89PNG\r\n\x1a\n', chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6 if arr.shape[2] == 4 else 2, 0, 0, 0))]
+    if dpi:  # pHYs, so Word, PowerPoint, and Inkscape place the PNG at the same physical size as the PDF
+        out.append(chunk(b'pHYs', struct.pack('>IIB', int(round(dpi[0] / 0.0254)), int(round(dpi[1] / 0.0254)), 1)))
     for key, value in texts:
         out.append(chunk(b'tEXt', key.encode('latin-1') + b'\x00' + value.encode('latin-1', 'replace')))
     out.append(chunk(b'IDAT', zlib.compress(raw, 6)))
