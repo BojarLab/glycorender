@@ -189,7 +189,8 @@ def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1, d
                         # Or if 'm' follows Z, curr_x, curr_y would be start_x, start_y of closed subpath
                         # For simplicity, assume curr_x, curr_y is correctly set from previous command or (0,0)
                         pass
-                    curr_x += dx; curr_y += dy
+                    curr_x += dx
+                    curr_y += dy
                     if first_x is None: first_x, first_y = curr_x, curr_y
                     if start_x is None or i == 0: start_x, start_y = curr_x, curr_y
                     path.moveTo(curr_x, curr_y)
@@ -199,21 +200,25 @@ def draw_path(c, commands, stroke_color=None, fill_color=None, stroke_width=1, d
                     path.lineTo(curr_x, curr_y)
             elif cmd == 'l':
                 for i in range(0, len(params), 2):
-                    dx, dy = float(params[i]), float(params[i+1])
-                    curr_x += dx; curr_y += dy
+                    curr_x += float(params[i])
+                    curr_y += float(params[i + 1])
                     path.lineTo(curr_x, curr_y)
             elif cmd == 'H':
                 for param in params:
-                    curr_x = float(param); path.lineTo(curr_x, curr_y)
+                    curr_x = float(param)
+                    path.lineTo(curr_x, curr_y)
             elif cmd == 'h':
                 for param in params:
-                    curr_x += float(param); path.lineTo(curr_x, curr_y)
+                    curr_x += float(param)
+                    path.lineTo(curr_x, curr_y)
             elif cmd == 'V':
                 for param in params:
-                    curr_y = float(param); path.lineTo(curr_x, curr_y)
+                    curr_y = float(param)
+                    path.lineTo(curr_x, curr_y)
             elif cmd == 'v':
                 for param in params:
-                    curr_y += float(param); path.lineTo(curr_x, curr_y)
+                    curr_y += float(param)
+                    path.lineTo(curr_x, curr_y)
             elif cmd == 'Q': # Quadratic Bezier
                 # A Q command has (x1 y1 x y)+ parameters. x1,y1 is control, x,y is endpoint.
                 # Loop if multiple Q segments are chained (e.g., Q c1_1,e1_1 c1_2,e2_2)
@@ -340,8 +345,8 @@ def draw_text_on_path(c, text, path_points, offset_percent, font_name, font_size
     c.saveState()
     c.translate(x, y)
     c.rotate(angle)
-    if c.state['ctm'][
-        0] < -1e-6:  # the carrier runs right-to-left on the page (vertical mode turns some bonds that way), so turn the label upright on the same side of the line
+    # The carrier runs right-to-left on the page (vertical mode turns some bonds that way), so turn the label upright on the same side of the line
+    if c.state['ctm'][0] < -1e-6:
         c.rotate(180)
         ttf = pdfmetrics.fonts[actual_font].ttf
         offset_y = ttf.cap_height / ttf.units_per_em * font_size - offset_y
@@ -357,8 +362,8 @@ def draw_text_on_path(c, text, path_points, offset_percent, font_name, font_size
     if italic_f:
         c.drawString(0, 0, text[:-1])
         c.translate(pdfmetrics.stringWidth(text[:-1], actual_font, font_size), 0)
-        c.transform(1, 0, 0.3, 1, -0.3 * font_size / 2 if text == 'f' else 0,
-                    0)  # Positive skew for forward lean; only a lone f is pulled back to stay centred, after a letter it would collide
+        # Positive skew for forward lean; only a lone f is pulled back to stay centered, after a letter it would collide
+        c.transform(1, 0, 0.3, 1, -0.3 * font_size / 2 if text == 'f' else 0, 0)
         c.drawString(0, 0, 'f')
     else:
         c.drawString(0, 0, text, charSpace = char_space)
@@ -557,10 +562,6 @@ def extract_defs(root, ns, elem_ctm = None):
                 parsed_stop_color = parse_color(stop_color_str)
                 if parsed_stop_color and isinstance(parsed_stop_color, tuple):
                     color_tuple = parsed_stop_color + (opacity,)
-                elif stop_color_str.startswith('#'):
-                    if len(stop_color_str) == 7:
-                        r_val = int(stop_color_str[1:3],16)/255.0; g_val=int(stop_color_str[3:5],16)/255.0; b_val=int(stop_color_str[5:7],16)/255.0
-                        color_tuple = (r_val,g_val,b_val,opacity)
                 if color_tuple: stops.append((offset, color_tuple))
             axis = [_grad_num(radial_gradient, k, dv) for k, dv in (('x1', 0.0), ('y1', 0.0), ('x2', 1.0), ('y2', 0.0))]
             all_gradients[gradient_id] = {'kind': kind, 'cx': cx, 'cy': cy, 'r': r_grad, 'axis': axis, 'stops': stops,
@@ -877,16 +878,16 @@ def _render_svg_to_pdf_canvas(svg_data: str,
         if is_gradient_fill and final_stroke_c is None:  # Gradient and no separate stroke: already handled by draw_circles_with_gradients
             c.restoreState()
             continue
-        cx_c = float(circle_element.get('cx', '0'));
-        cy_c = float(circle_element.get('cy', '0'));
+        cx_c = float(circle_element.get('cx', '0'))
+        cy_c = float(circle_element.get('cy', '0'))
         r_c = float(circle_element.get('r', '0'))
         draw_circle(c, cx_c, cy_c, r_c, final_stroke_c, None if isinstance(final_fill_c, str) else final_fill_c, sw_c)
         c.restoreState()
     for rect_element in root.findall('.//svg:rect', ns):
         _apply_ctm(c, elem_ctm, rect_element)
         final_fill_r, final_stroke_r, sw_r = _resolve_paint(rect_element, default_fill = 'none', use_opacity = True)
-        x_r = float(rect_element.get('x', '0')); y_r = float(rect_element.get('y', '0'))
-        w_r = float(rect_element.get('width', '0')); h_r = float(rect_element.get('height', '0'))
+        x_r, y_r = float(rect_element.get('x', '0')), float(rect_element.get('y', '0'))
+        w_r, h_r = float(rect_element.get('width', '0')), float(rect_element.get('height', '0'))
         if isinstance(final_fill_r, str) and final_fill_r in all_gradients and all_gradients[final_fill_r]['stops']:
             grad_r_data = all_gradients[final_fill_r]
             c.saveState()
@@ -899,8 +900,8 @@ def _render_svg_to_pdf_canvas(svg_data: str,
     for ellipse_element in root.findall('.//svg:ellipse', ns):
         _apply_ctm(c, elem_ctm, ellipse_element)
         final_fill_e, final_stroke_e, sw_e = _resolve_paint(ellipse_element, default_fill = 'black')
-        cx_e = float(ellipse_element.get('cx', '0')); cy_e = float(ellipse_element.get('cy', '0'))
-        rx_e = float(ellipse_element.get('rx', '0')); ry_e = float(ellipse_element.get('ry', '0'))
+        cx_e, cy_e = float(ellipse_element.get('cx', '0')), float(ellipse_element.get('cy', '0'))
+        rx_e, ry_e = float(ellipse_element.get('rx', '0')), float(ellipse_element.get('ry', '0'))
         if isinstance(final_fill_e, str) and final_fill_e in all_gradients and all_gradients[final_fill_e]['stops']:
             grad_e_data = all_gradients[final_fill_e]
             c.saveState()

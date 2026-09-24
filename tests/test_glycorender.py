@@ -154,3 +154,25 @@ def test_pdf_sticker_layer_stays_vector(tmp_path):
     assert b'1 1 1 rg' in cut_ops and b'1 J 1 j' in cut_ops  # white cut painted with round joins, as real path ops
     assert b'1 1 1 rg' not in plain_ops
     assert b'/Shadow' in cut.read_bytes()  # only the blurred shadow is rasterized
+
+
+def test_png_records_its_resolution():
+    png = convert_svg_to_png(SNFG_SVG, None, scale = 300 / 72, return_bytes = True)
+    i = png.index(b'pHYs')
+    assert round(int.from_bytes(png[i + 4:i + 8], 'big') * 0.0254) == 300 and png[i + 12] == 1  # pixels per metre
+
+
+def test_labels_never_read_right_to_left():
+    for turn in (0, 45, 90, 135, 180, 225, 270, 315):
+        c = _render_svg_to_pdf_canvas(SNFG_SVG.replace('rotate(0 ', 'rotate(%d ' % turn), None)
+        assert all(op['ctm'][0] > -1e-6 for op in c.ops if op['kind'] == 'text')
+
+
+def test_ring_label_at_the_origin_is_drawn():
+    carrier = '<path d="M-50,0 L50,0" stroke-width="0" id="d1" />\n</defs>'
+    label = ('<text font-size="15.0" fill="#000000" text-anchor="middle"><textPath xlink:href="#d1" startOffset="50%">'
+             '<tspan dy="0.5em">Lf</tspan></textPath></text>\n</g>')
+    svg = SNFG_SVG.replace('</defs>', carrier).replace('</g>', label)
+    texts = [op for op in _render_svg_to_pdf_canvas(svg, None).ops if op['kind'] == 'text']
+    assert [op['text'] for op in texts] == ['b3', 'L', 'f']
+    assert texts[2]['ctm'][2] != 0  # the furanose f is skewed into a faked italic

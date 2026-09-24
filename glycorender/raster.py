@@ -118,8 +118,8 @@ def _norm(poly):
 
 
 def _arc(cx, cy, r):
-    t = np.linspace(0, 2 * math.pi, max(16, int(7 * math.sqrt(r))),
-                    endpoint = False)  # keeps the facet sagitta under 0.1 px at any zoom
+    # Facet count grows with the radius, keeping the sagitta under 0.1 px at any zoom
+    t = np.linspace(0, 2 * math.pi, max(16, int(7 * math.sqrt(r))), endpoint = False)
     return list(zip((cx + r * np.cos(t)).tolist(), (cy + r * np.sin(t)).tolist()))
 
 

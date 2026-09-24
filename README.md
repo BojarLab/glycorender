@@ -56,13 +56,23 @@ GlycoRender is specifically designed for:
 
 ## API Reference
 
-### `convert_svg_to_pdf(svg_data, pdf_file_path)`
-### `convert_svg_to_png(svg_data, png_file_path)`
-Converts SVG data to a PDF/PNG file.
+### `convert_svg_to_pdf(svg_data, pdf_file_path, return_canvas=False, chem=False, shadow=False, sticker=False)`
+Renders SVG data to a PDF with embedded, subset fonts.
 
-Parameters:
-- `svg_data` (str or bytes): SVG content either as a string or bytes
-- `png_file_path` (str): Path where the output PNG should be saved
+### `convert_svg_to_png(svg_data, png_file_path=None, output_width=None, output_height=None, scale=None, return_bytes=False, chem=False, background=None, shadow=False, sticker=False)`
+Renders SVG data to a PNG. `scale` multiplies the page size (1.0 is 72 dpi, `300 / 72` is 300 dpi), and the resolution is stored in the file, so the PNG is placed at the same physical size as the PDF. `background=None` keeps the background transparent.
+
+Parameters shared by both:
+- `svg_data` (str or bytes): SVG content
+- `shadow` (bool or dict): soft drop shadow under the monosaccharide symbols; a dict overrides `dx`, `dy`, `blur`, `alpha`, `color`
+- `sticker` (bool or dict): die-cut outline around the whole structure; a dict overrides `width`, `color`, `edge`, `edge_color`, `shadow`
+- `chem` (bool): the input is an RDKit SVG
+
+### `pdf_to_svg_bytes(svg_string, shadow=False, sticker=False)`
+Returns an SVG that looks exactly like the PDF, with text as outlines.
+
+### `simple_svg_to_pdf(svg_data, pdf_path)` / `simple_svg_to_png(svg_data, png_path)`
+Render a general matplotlib-style SVG (e.g., a figure with embedded glycans) without glycan-specific handling.
 
 ## Supported SVG Elements
 
