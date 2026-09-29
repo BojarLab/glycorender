@@ -479,26 +479,26 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
                 polys = stroke_polys(subs, op['line_width'] * sc, op['cap'], op['join'], dash,
                                      (op['dash'][1] if op['dash'] else 0.0) * sc)
                 img.paint(_edges(polys, True), op['stroke_rgb'], op['stroke_alpha'], False, box)
-            elif op['kind'] == 'image':
-                # Nearest-neighbor lookup of each device pixel center in the unit square the image is drawn onto
-                inv, corners = _inv(ctm), [_apply(ctm, u, v) for u in (0, 1) for v in (0, 1)]
-                lo, hi = (box[:2], box[2:]) if box else ((0, 0), (w, h))
-                x0 = max(0, int(math.floor(max(min(p[0] for p in corners), lo[0]))))
-                x1 = min(w, int(math.ceil(min(max(p[0] for p in corners), hi[0]))))
-                y0 = max(0, int(math.floor(max(min(p[1] for p in corners), lo[1]))))
-                y1 = min(h, int(math.ceil(min(max(p[1] for p in corners), hi[1]))))
-                if x1 <= x0 or y1 <= y0: continue
-                px, py = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
-                u, v = inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]
-                col = np.clip((u * op['w']).astype(np.intp), 0, op['w'] - 1)
-                row = np.clip(((1 - v) * op['h']).astype(np.intp), 0, op['h'] - 1)
-                a = ((u >= 0) & (u < 1) & (v > 0) & (v <= 1)) * op['fill_alpha']
-                if op['alpha'] is not None:
-                    a = a * np.frombuffer(op['alpha'], np.uint8).reshape(op['h'], op['w'])[row, col] / 255.0
-                a3, sub = a[:, :, None], img.buf[y0:y1, x0:x1]
-                sub[:, :, :3] = sub[:, :, :3] * (1 - a3) + np.frombuffer(op['rgb'], np.uint8).reshape(
-                    op['h'], op['w'], 3)[row, col] / 255.0 * a3
-                sub[:, :, 3] = sub[:, :, 3] * (1 - a) + a
+        elif op['kind'] == 'image':
+            # Nearest-neighbor lookup of each device pixel center in the unit square the image is drawn onto
+            inv, corners = _inv(ctm), [_apply(ctm, u, v) for u in (0, 1) for v in (0, 1)]
+            lo, hi = (box[:2], box[2:]) if box else ((0, 0), (w, h))
+            x0 = max(0, int(math.floor(max(min(p[0] for p in corners), lo[0]))))
+            x1 = min(w, int(math.ceil(min(max(p[0] for p in corners), hi[0]))))
+            y0 = max(0, int(math.floor(max(min(p[1] for p in corners), lo[1]))))
+            y1 = min(h, int(math.ceil(min(max(p[1] for p in corners), hi[1]))))
+            if x1 <= x0 or y1 <= y0: continue
+            px, py = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
+            u, v = inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]
+            col = np.clip((u * op['w']).astype(np.intp), 0, op['w'] - 1)
+            row = np.clip(((1 - v) * op['h']).astype(np.intp), 0, op['h'] - 1)
+            a = ((u >= 0) & (u < 1) & (v > 0) & (v <= 1)) * op['fill_alpha']
+            if op['alpha'] is not None:
+                a = a * np.frombuffer(op['alpha'], np.uint8).reshape(op['h'], op['w'])[row, col] / 255.0
+            a3, sub = a[:, :, None], img.buf[y0:y1, x0:x1]
+            sub[:, :, :3] = sub[:, :, :3] * (1 - a3) + np.frombuffer(op['rgb'], np.uint8).reshape(
+                op['h'], op['w'], 3)[row, col] / 255.0 * a3
+            sub[:, :, 3] = sub[:, :, 3] * (1 - a) + a
         else:
             subs = []
             for cmds, gctm in _glyph_paths(op, ctm):

@@ -422,7 +422,7 @@ def _read_kerning(font):
                 st += delta
             elif kind != 2:
                 continue
-            _pair_subtable(d, st, pairs)
+            _pair_subtable(d, st, found)
         for key, adj in found.items():
             pairs[key] = pairs.get(key, 0) + adj
     if not pairs and 'kern' in font.tables:  # GPOS present but no usable kern feature

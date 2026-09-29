@@ -31,3 +31,7 @@ packages = ["glycorender"]
 
 [tool.setuptools.package-data]
 glycorender = ["fonts/*.ttf", "fonts/LICENSE.txt"]
+
+[tool.pytest.ini_options]
+# Tests import this checkout, never a stale glycorender installed in site-packages
+pythonpath = ["."]
