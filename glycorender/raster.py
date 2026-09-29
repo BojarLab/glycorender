@@ -198,7 +198,15 @@ def stroke_polys(subs, width, cap, join, dash = None, phase = 0.0):
             for i in joints:
                 (px, py), (cx, cy), (nx2, ny2) = run[-2 if i == 0 else i - 1], run[i], run[i + 1]
                 if join == 1:
-                    polys.append(_arc(cx, cy, hw))
+                    # Only the outer wedge between the two segment ends is uncovered, so a sector does what a whole
+                    # disc did; along a flattened curve the turn is a degree or two and the sector a couple of facets
+                    a1, a2 = math.atan2(cy - py, cx - px), math.atan2(ny2 - cy, nx2 - cx)
+                    turn = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
+                    s = math.pi / 2 if turn > 0 else -math.pi / 2
+                    n = max(2, int(math.ceil(abs(turn) / (2 * math.pi) * max(16, int(7 * math.sqrt(hw))))) + 1)
+                    t = np.linspace(a1 - s, a1 - s + turn, n + 1)
+                    fan = [(cx, cy)] + list(zip((cx + hw * np.cos(t)).tolist(), (cy + hw * np.sin(t)).tolist()))
+                    polys.append(fan if turn > 0 else fan[::-1])
                     continue
                 u1 = ((cx - px), (cy - py))
                 u2 = ((nx2 - cx), (ny2 - cy))
@@ -286,13 +294,20 @@ class Image:
         y1 = min(self.h, int(math.ceil(min(edges[:, [1, 3]].max(), hi[1]))) + 1)
         if x1 <= x0 or y1 <= y0: return
         a = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd) * alpha
-        if not a.any(): return
-        # Blend only the covered pixels; the edge box of a slanted linkage is mostly empty
         ys, xs = np.nonzero(a)
+        if not len(ys): return
+        col = np.append(np.asarray(rgb, dtype = np.float64), 1.0)
+        # A mostly covered box (a figure or axes background, a square symbol) blends fastest as one slice
+        if 2 * len(ys) > a.size:
+            a3, sub = a[:, :, None], self.buf[y0:y1, x0:x1]
+            sub *= 1 - a3
+            sub += col * a3
+            return
+        # Otherwise blend only the covered pixels; the edge box of a slanted linkage is mostly empty
         v = a[ys, xs][:, None]
         ys += y0
         xs += x0
-        self.buf[ys, xs] = self.buf[ys, xs] * (1 - v) + np.append(np.asarray(rgb, dtype = np.float64), 1.0) * v
+        self.buf[ys, xs] = self.buf[ys, xs] * (1 - v) + col * v
     def paint_grad(self, edges, grad, ctm, alpha, even_odd = False, box = None):
         """Fill `edges` with a radial gradient evaluated per pixel in the op's user space."""
         inv = _inv(ctm)
@@ -366,12 +381,12 @@ def _box_blur(a, radius):
     k = 2 * int(radius) + 1
     for _ in range(3):
         for axis in (0, 1):
-            pad = np.pad(a, ((k // 2, k // 2), (0, 0)) if axis == 0 else ((0, 0), (k // 2, k // 2)))
+            # One extra zero in front makes every window a plain difference of the running sum, with no stacking;
+            # the passes are linear, so the six divisions by k collapse into one at the end
+            pad = np.pad(a, ((k // 2 + 1, k // 2), (0, 0)) if axis == 0 else ((0, 0), (k // 2 + 1, k // 2)))
             c = np.cumsum(pad, axis = axis)
-            head = c[k - 1:k] if axis == 0 else c[:, k - 1:k]
-            rest = (c[k:] - c[:-k]) if axis == 0 else (c[:, k:] - c[:, :-k])
-            a = (np.vstack([head, rest]) if axis == 0 else np.hstack([head, rest])) / k
-    return a
+            a = (c[k:] - c[:-k]) if axis == 0 else (c[:, k:] - c[:, :-k])
+    return a / k ** 6
 
 
 def _ink_mask(ops, w, h, flip, dx = 0.0, dy = 0.0, grow = 0.0, symbols_only = True):
@@ -464,6 +479,26 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
                 polys = stroke_polys(subs, op['line_width'] * sc, op['cap'], op['join'], dash,
                                      (op['dash'][1] if op['dash'] else 0.0) * sc)
                 img.paint(_edges(polys, True), op['stroke_rgb'], op['stroke_alpha'], False, box)
+            elif op['kind'] == 'image':
+                # Nearest-neighbor lookup of each device pixel center in the unit square the image is drawn onto
+                inv, corners = _inv(ctm), [_apply(ctm, u, v) for u in (0, 1) for v in (0, 1)]
+                lo, hi = (box[:2], box[2:]) if box else ((0, 0), (w, h))
+                x0 = max(0, int(math.floor(max(min(p[0] for p in corners), lo[0]))))
+                x1 = min(w, int(math.ceil(min(max(p[0] for p in corners), hi[0]))))
+                y0 = max(0, int(math.floor(max(min(p[1] for p in corners), lo[1]))))
+                y1 = min(h, int(math.ceil(min(max(p[1] for p in corners), hi[1]))))
+                if x1 <= x0 or y1 <= y0: continue
+                px, py = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
+                u, v = inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]
+                col = np.clip((u * op['w']).astype(np.intp), 0, op['w'] - 1)
+                row = np.clip(((1 - v) * op['h']).astype(np.intp), 0, op['h'] - 1)
+                a = ((u >= 0) & (u < 1) & (v > 0) & (v <= 1)) * op['fill_alpha']
+                if op['alpha'] is not None:
+                    a = a * np.frombuffer(op['alpha'], np.uint8).reshape(op['h'], op['w'])[row, col] / 255.0
+                a3, sub = a[:, :, None], img.buf[y0:y1, x0:x1]
+                sub[:, :, :3] = sub[:, :, :3] * (1 - a3) + np.frombuffer(op['rgb'], np.uint8).reshape(
+                    op['h'], op['w'], 3)[row, col] / 255.0 * a3
+                sub[:, :, 3] = sub[:, :, 3] * (1 - a) + a
         else:
             subs = []
             for cmds, gctm in _glyph_paths(op, ctm):

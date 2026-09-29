@@ -339,7 +339,7 @@ def _pair_subtable(d, st, pairs):
                 second = struct.unpack('>H', d[rec:rec + 2])[0]
                 adj = struct.unpack('>h', d[rec + 2 + skip:rec + 4 + skip])[0]
                 if adj:
-                    pairs[(first[i], second)] = adj
+                    pairs.setdefault((first[i], second), adj)
     elif fmt == 2:
         cd1_off, cd2_off, n1, n2 = struct.unpack('>HHHH', d[st + 8:st + 16])
         cd1, cd2 = _class_def(d, st + cd1_off), _class_def(d, st + cd2_off)
@@ -363,7 +363,7 @@ def _pair_subtable(d, st, pairs):
                     return
                 for g1 in by_class1[c1]:
                     for g2 in by_class2[c2]:
-                        pairs[(g1, g2)] = adj
+                        pairs.setdefault((g1, g2), adj)
 
 def _legacy_kern(font):
     """Pairs from the old TrueType 'kern' table, which pre-OpenType fonts use instead of GPOS."""
@@ -410,6 +410,9 @@ def _read_kerning(font):
             continue
         lo = lookup_off + struct.unpack('>H', d[lookup_off + 2 + 2 * idx:lookup_off + 4 + 2 * idx])[0]
         kind, _flag, n_sub = struct.unpack('>HHH', d[lo:lo + 6])
+        # Within a lookup the first subtable holding a pair wins (fonts list their exceptions ahead of the class
+        # kerning, e.g. Comfortaa's 'Q.' and 'D.'); separate lookups add up
+        found = {}
         for j in range(n_sub):
             st = lo + struct.unpack('>H', d[lo + 6 + 2 * j:lo + 8 + 2 * j])[0]
             if kind == 9:  # extension lookup: hop to the real subtable
@@ -420,6 +423,8 @@ def _read_kerning(font):
             elif kind != 2:
                 continue
             _pair_subtable(d, st, pairs)
+        for key, adj in found.items():
+            pairs[key] = pairs.get(key, 0) + adj
     if not pairs and 'kern' in font.tables:  # GPOS present but no usable kern feature
         return _legacy_kern(font)
     return pairs

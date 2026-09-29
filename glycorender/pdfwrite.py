@@ -1,5 +1,5 @@
 """Minimal PDF canvas: the subset of the reportlab API that render.py actually uses, stdlib only."""
-import os, zlib, math
+import os, zlib, math, struct
 from io import BytesIO
 from .ttf import TTF, subset
 
@@ -294,6 +294,49 @@ class Canvas:
         op.update(kind='text', x=x, y=y, text=text, font=self._font.name, ttf=self._font.ttf,
                   size=self._size, char_space=charSpace)
         self.ops.append(op)
+
+    def drawImage(self, png):
+        """PNG bytes onto the unit square of the current user space, first row at the top, as PDF images go.
+
+        Covers what matplotlib embeds for rasterized artists (colorbars, imshow): 8-bit, non-interlaced
+        gray, gray+alpha, RGB or RGBA. Anything else is skipped rather than drawn wrong.
+        """
+        pos, idat, head = 8, [], None
+        while png[:8] == b'\x89PNG\r\n\x1a\n' and pos + 8 <= len(png):
+            n, tag = struct.unpack('>I4s', png[pos:pos + 8])
+            if tag == b'IHDR':
+                head = struct.unpack('>IIBBBBB', png[pos + 8:pos + 21])
+            elif tag == b'IDAT':
+                idat.append(png[pos + 8:pos + 8 + n])
+            pos += 12 + n
+        bpp = {0: 1, 2: 3, 4: 2, 6: 4}.get(head[3]) if head and head[2] == 8 and not head[6] else None
+        if not bpp: return
+        w, h = head[0], head[1]
+        raw, stride = zlib.decompress(b''.join(idat)), w * bpp
+        prev, rows = bytearray(stride), []
+        for r in range(h):
+            f, line = raw[r * (stride + 1)], bytearray(raw[r * (stride + 1) + 1:(r + 1) * (stride + 1)])
+            # Up and None are whole-row operations; Sub, Average and Paeth chain along the row, byte by byte
+            if f == 2: line = bytearray((a + b) & 255 for a, b in zip(line, prev))
+            for i in range(stride) if f in (1, 3, 4) else ():
+                a = line[i - bpp] if i >= bpp else 0
+                if f == 1:
+                    line[i] = (line[i] + a) & 255
+                elif f == 3:
+                    line[i] = (line[i] + ((a + prev[i]) >> 1)) & 255
+                else:
+                    b, c = prev[i], prev[i - bpp] if i >= bpp else 0
+                    pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                    line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+            rows.append(line)
+            prev = line
+        px, rgb = b''.join(rows), bytearray(w * h * 3)
+        for k in range(3):
+            rgb[k::3] = px[(k if bpp > 2 else 0)::bpp]
+        op = dict(self.state)
+        op.update(kind = 'image', w = w, h = h, rgb = bytes(rgb), alpha = px[bpp - 1::bpp] if bpp in (2, 4) else None)
+        self.ops.append(op)
+
     # --- metadata ---
     def setTitle(self, v):
         self.info['Title'] = v
@@ -334,7 +377,7 @@ class Canvas:
                 xs.append(seg[i])
                 ys.append(seg[i + 1])
         return (min(xs), min(ys), max(xs), max(ys))
-    def _content(self, alphas, shadings):
+    def _content(self, alphas, shadings, images):
         buf = []
         for op in self.ops:
             buf.append('q')
@@ -370,6 +413,9 @@ class Canvas:
                         buf.append('[%s] %s d' % (' '.join(_fmt(v) for v in op['dash'][0]), _fmt(op['dash'][1])))
                 buf.extend(path)
                 buf.append(('B' + eo) if (solid and op['stroke']) else ('f' + eo) if solid else 'S')
+            elif op['kind'] == 'image':
+                buf.append('/%s gs /Im%d Do' % (_alpha_name(alphas, op['fill_alpha'], False), len(images)))
+                images.append(op)
             else:
                 buf.append('/%s gs' % _alpha_name(alphas, op['fill_alpha'], False))
                 buf.append('%s %s %s rg' % tuple(_fmt(v) for v in op['fill_rgb']))
@@ -444,6 +490,11 @@ class Canvas:
     def _font_objects(self, out, name, font):
         ttf = font.ttf
         scale = 1000.0 / ttf.units_per_em
+        kept = sorted(g for g in self.glyphs.get(name, set()) if g < ttf.num_glyphs)
+        # A subset must be named TAG+Font (ISO 32000-1, 9.6.4), or readers take it for the complete font; the tag
+        # is derived from the glyph set, so the output stays reproducible and different subsets never share a name
+        crc = zlib.crc32(str(kept).encode())
+        base = ''.join(chr(65 + crc // 26 ** i % 26) for i in range(6)) + '+' + name
         raw = subset(ttf, self.glyphs.get(name, set()))
         packed = zlib.compress(raw, 9)
         file_ref = out.add(b'<< /Length %d /Length1 %d /Filter /FlateDecode >>\nstream\n' % (len(packed), len(raw))
@@ -451,14 +502,13 @@ class Canvas:
         flags = 4 | (1 if ttf.mac_style & 2 else 0) << 6
         desc = out.add(('<< /Type /FontDescriptor /FontName /%s /Flags %d /FontBBox [%d %d %d %d] '
                         '/ItalicAngle %s /Ascent %d /Descent %d /CapHeight %d /StemV 80 /FontFile2 %d 0 R >>'
-                        % (name, flags, *[int(v * scale) for v in ttf.bbox], _fmt(ttf.italic_angle),
+                        % (base, flags, *[int(v * scale) for v in ttf.bbox], _fmt(ttf.italic_angle),
                            int(ttf.ascent * scale), int(ttf.descent * scale), int(ttf.cap_height * scale),
                            file_ref)).encode())
-        kept = sorted(g for g in self.glyphs.get(name, set()) if g < ttf.num_glyphs)
         widths = '[%s]' % ' '.join('%d [%d]' % (g, int(round(ttf.width(g)))) for g in kept)
         cid = out.add(('<< /Type /Font /Subtype /CIDFontType2 /BaseFont /%s /CIDSystemInfo '
                        '<< /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor %d 0 R '
-                       '/DW 1000 /W %s /CIDToGIDMap /Identity >>' % (name, desc, widths)).encode())
+                       '/DW 1000 /W %s /CIDToGIDMap /Identity >>' % (base, desc, widths)).encode())
         # Map only the glyphs the page uses; the whole cmap made up ~40% of a typical GlycoDraw PDF
         used = set(kept)
         pairs = sorted((g, ch) for ch, g in ttf.cmap.items() if g in used)
@@ -473,17 +523,30 @@ class Canvas:
         packed_cmap = zlib.compress(cmap.encode('latin-1'), 9)
         tou = out.add(b'<< /Length %d /Filter /FlateDecode >>\nstream\n' % len(packed_cmap) + packed_cmap + b'\nendstream')
         return out.add(('<< /Type /Font /Subtype /Type0 /BaseFont /%s /Encoding /Identity-H '
-                        '/DescendantFonts [%d 0 R] /ToUnicode %d 0 R >>' % (name, cid, tou)).encode())
+                        '/DescendantFonts [%d 0 R] /ToUnicode %d 0 R >>' % (base, cid, tou)).encode())
     def save(self):
         out = _Writer()
-        alphas, shadings = {}, {}
-        body = self._content(alphas, shadings)
+        alphas, shadings, images = {}, {}, []
+        body = self._content(alphas, shadings, images)
         shadow, sticker = self._effects()
         if sticker:
             body = self._sticker_content(alphas, sticker) + '\n' + body
         xobj = ''
+        for i, op in enumerate(images):
+            smask = ''
+            if op['alpha'] is not None and min(op['alpha']) < 255:
+                packed = zlib.compress(op['alpha'], 6)
+                smask = '/SMask %d 0 R ' % out.add(
+                    ('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 8 '
+                     '/Filter /FlateDecode /Length %d >>\nstream\n' % (op['w'], op['h'], len(packed))).encode()
+                    + packed + b'\nendstream')
+            packed = zlib.compress(op['rgb'], 6)
+            xobj += '/Im%d %d 0 R ' % (i, out.add(
+                ('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB /BitsPerComponent 8 '
+                 '%s/Filter /FlateDecode /Length %d >>\nstream\n' % (op['w'], op['h'], smask, len(packed))).encode()
+                + packed + b'\nendstream'))
         if shadow:
-            xobj = '/Shadow %d 0 R' % self._shadow_object(out, shadow, sticker)
+            xobj += '/Shadow %d 0 R' % self._shadow_object(out, shadow, sticker)
             body = 'q %s 0 0 %s 0 0 cm /Shadow Do Q\n' % (_fmt(self.width), _fmt(self.height)) + body
         content = zlib.compress(body.encode('latin-1'), 9)
         stream = out.add(b'<< /Length %d /Filter /FlateDecode >>\nstream\n' % len(content) + content + b'\nendstream')

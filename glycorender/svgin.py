@@ -4,7 +4,7 @@ Used only by simple_svg_to_pdf/png, i.e. annotate_figure output: a matplotlib fi
 glycan drawings pasted in. Unlike render.py this walks the tree in document order and honors
 nested transforms; it is deliberately not a complete SVG implementation.
 """
-import math, re
+import base64, math, re
 import xml.etree.ElementTree as ET
 from . import pdfwrite as canvas
 from .pdfwrite import pdfmetrics
@@ -321,6 +321,17 @@ class _Renderer:
             v = [float(n) for n in _NUM.findall(el.get('points', ''))]
             pts = [('m' if i == 0 else 'l', v[i], v[i + 1]) for i in range(0, len(v) - 1, 2)]
             if pts: self.paint(pts + ([('h',)] if tag == 'polygon' else []), style, ctm, clip)
+        elif tag == 'image':
+            # matplotlib embeds rasterized artists, a continuous colorbar above all, as base64 PNG
+            m = re.match(r'\s*data:image/png;base64,(.*)', _href(el) or '', re.S)
+            if not m: return
+            x, y, w, h = (_num(el.get(k)) for k in ('x', 'y', 'width', 'height'))
+            self.c.saveState()
+            self.c.state['ctm'] = _mul((w, 0.0, 0.0, -h, x, y + h), ctm)
+            self.c.state['clip'] = clip
+            self.c.setFillColorRGB(0, 0, 0, alpha = _num(style.get('opacity'), 1.0))
+            self.c.drawImage(base64.b64decode(re.sub(r'\s+', '', m.group(1))))
+            self.c.restoreState()
         elif tag in ('text', 'tspan'):
             self._text(el, style, ctm, clip, depth)
 
