@@ -459,7 +459,9 @@ class Canvas:
         cid = out.add(('<< /Type /Font /Subtype /CIDFontType2 /BaseFont /%s /CIDSystemInfo '
                        '<< /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor %d 0 R '
                        '/DW 1000 /W %s /CIDToGIDMap /Identity >>' % (name, desc, widths)).encode())
-        pairs = sorted((g, ch) for ch, g in ttf.cmap.items() if g < ttf.num_glyphs)
+        # Map only the glyphs the page uses; the whole cmap made up ~40% of a typical GlycoDraw PDF
+        used = set(kept)
+        pairs = sorted((g, ch) for ch, g in ttf.cmap.items() if g in used)
         cmap = ('/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /A def /CMapType 2 def\n'
                 '1 begincodespacerange <0000> <FFFF> endcodespacerange\n')
         for i in range(0, len(pairs), 100):
@@ -502,8 +504,11 @@ class Canvas:
         root = out.add(('<< /Type /Catalog /Pages %d 0 R >>' % pages_ref).encode())
         info = None
         if self.info:
-            info = out.add(b'<< ' + b' '.join(b'/%s (%s)' % (k.encode(), _esc(v.encode('latin-1', 'replace')))
-                                              for k, v in self.info.items()) + b' >>')
+            # Non-ASCII text strings go out as UTF-16BE with a BOM, so α, β, and → survive instead of becoming '?'
+            info = out.add(b'<< ' + b' '.join(
+                b'/%s (%s)' % (k.encode(), _esc(v.encode('ascii'))) if v.isascii()
+                else b'/%s <FEFF%s>' % (k.encode(), v.encode('utf-16-be').hex().upper().encode())
+                for k, v in self.info.items()) + b' >>')
         data = out.render(root, info)
         if hasattr(self.target, 'write'):
             self.target.write(data)

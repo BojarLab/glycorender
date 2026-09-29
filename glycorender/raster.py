@@ -3,6 +3,9 @@ import math, struct, zlib
 import numpy as np
 
 SS = 4  # vertical subsamples per pixel; horizontal coverage is analytic
+# Cubic Bernstein weights for every step count flatten() can pick, so a curve costs four multiply-adds, not a linspace
+_BERNSTEIN = {n: ((1 - t)**3, 3*(1 - t)**2*t, 3*(1 - t)*t**2, t**3)
+              for n in range(3, 65) for t in [np.linspace(0, 1, n + 1)[1:]]}
 
 
 def _apply(ctm, x, y):
@@ -47,11 +50,9 @@ def flatten(ops, ctm):
             p1, p2, p3 = _apply(ctm, op[1], op[2]), _apply(ctm, op[3], op[4]), _apply(ctm, op[5], op[6])
             span = (abs(p1[0]-p0[0]) + abs(p1[1]-p0[1]) + abs(p2[0]-p1[0]) + abs(p2[1]-p1[1])
                     + abs(p3[0]-p2[0]) + abs(p3[1]-p2[1]))
-            n = min(64, max(3, int(span / 3.0) + 3))
-            t = np.linspace(0, 1, n + 1)[1:]
-            mt = 1 - t
-            xs = mt**3*p0[0] + 3*mt**2*t*p1[0] + 3*mt*t**2*p2[0] + t**3*p3[0]
-            ys = mt**3*p0[1] + 3*mt**2*t*p1[1] + 3*mt*t**2*p2[1] + t**3*p3[1]
+            b0, b1, b2, b3 = _BERNSTEIN[min(64, max(3, int(span / 3.0) + 3))]
+            xs = b0*p0[0] + b1*p1[0] + b2*p2[0] + b3*p3[0]
+            ys = b0*p0[1] + b1*p1[1] + b2*p2[1] + b3*p3[1]
             cur.extend(zip(xs.tolist(), ys.tolist()))
         elif k == 'h':
             if cur and start and cur[-1] != start: cur.append(start)
@@ -85,21 +86,33 @@ def coverage(edges, x0, y0, w, h, even_odd = False):
     dirs = np.where(ey1 > ey0, 1.0, -1.0)
     slope = (ex1 - ex0) / (ey1 - ey0)
     rows = h * SS
-    chunk = max(SS, int(4e6 // max(1, len(edges))) // SS * SS)
+    ys = y0 + (np.arange(rows) + 0.5) / SS
+    # Each edge only tests the sub-scanlines its y-range spans (plus one of slack each side, which the exact test
+    # drops), instead of every edge against every scanline; the (row, edge) order of np.nonzero is kept
+    lo = np.clip(np.floor((np.minimum(ey0, ey1) - y0) * SS - 0.5).astype(np.intp) - 1, 0, rows)
+    n = np.clip(np.ceil((np.maximum(ey0, ey1) - y0) * SS - 0.5).astype(np.intp) + 1, 0, rows) - lo
+    n = np.maximum(n, 0)
+    ei = np.repeat(np.arange(len(edges)), n)
+    ri = np.arange(len(ei)) - np.repeat(np.cumsum(n) - n, n) + lo[ei]
+    keep = (ey0[ei] <= ys[ri]) != (ey1[ei] <= ys[ri])
+    ri, ei = ri[keep], ei[keep]
+    order = np.lexsort((ei, ri))
+    ri, ei = ri[order], ei[order]
+    chunk = max(SS, int(4e6 // (w + 2)) // SS * SS)
     for r0 in range(0, rows, chunk):
         r1 = min(rows, r0 + chunk)
-        ys = y0 + (np.arange(r0, r1) + 0.5) / SS
-        hit = (ey0 <= ys[:, None]) != (ey1 <= ys[:, None])
-        ri, ei = np.nonzero(hit)
-        if not len(ri): continue
-        xs = ex0[ei] + (ys[ri] - ey0[ei]) * slope[ei]
+        a, b = np.searchsorted(ri, (r0, r1))
+        if a == b: continue
+        cr, ce = ri[a:b], ei[a:b]
+        xs = ex0[ce] + (ys[cr] - ey0[ce]) * slope[ce]
         xs = np.clip(xs - x0, 0.0, float(w))
         ix = np.floor(xs).astype(np.intp)
         frac = xs - ix
-        d = dirs[ei]
-        acc = np.zeros((r1 - r0, w + 2))
-        np.add.at(acc, (ri, ix), d * (1.0 - frac))
-        np.add.at(acc, (ri, ix + 1), d * frac)
+        d = dirs[ce]
+        # bincount accumulates in input order exactly like np.add.at, at a fraction of the cost
+        flat = (cr - r0) * (w + 2) + ix
+        acc = np.bincount(np.concatenate([flat, flat + 1]), np.concatenate([d * (1.0 - frac), d * frac]),
+                          (r1 - r0) * (w + 2)).reshape(r1 - r0, w + 2)
         wind = np.cumsum(acc, axis = 1)[:, :w]
         if even_odd:
             m = np.abs(wind) % 2.0
@@ -108,13 +121,6 @@ def coverage(edges, x0, y0, w, h, even_odd = False):
             band = np.clip(np.abs(wind), 0.0, 1.0)
         cov[r0 // SS:r1 // SS] += band.reshape(-1, SS, w).sum(axis = 1) / SS
     return np.clip(cov, 0.0, 1.0)
-
-
-def _norm(poly):
-    """Force positive orientation so overlapping stroke pieces union under the nonzero rule."""
-    p = np.asarray(poly)
-    area = np.dot(p[:, 0], np.roll(p[:, 1], -1)) - np.dot(p[:, 1], np.roll(p[:, 0], -1))
-    return poly if area >= 0 else poly[::-1]
 
 
 def _arc(cx, cy, r):
@@ -186,7 +192,8 @@ def stroke_polys(subs, width, cap, join, dash = None, phase = 0.0):
                 if cap == 2 and not closed and i in (0, len(run) - 2):
                     if i == 0: ax, ay = ax - ux * hw, ay - uy * hw
                     if i == len(run) - 2: bx, by = bx + ux * hw, by + uy * hw
-                polys.append(_norm([(ax + nx, ay + ny), (bx + nx, by + ny), (bx - nx, by - ny), (ax - nx, ay - ny)]))
+                # This quad is always clockwise (its area is -2 * ln * hw), so emit it reversed instead of calling _norm
+                polys.append([(ax - nx, ay - ny), (bx - nx, by - ny), (bx + nx, by + ny), (ax + nx, ay + ny)])
             joints = list(range(1, len(run) - 1)) + ([0] if closed else [])
             for i in joints:
                 (px, py), (cx, cy), (nx2, ny2) = run[-2 if i == 0 else i - 1], run[i], run[i + 1]
@@ -212,7 +219,8 @@ def stroke_polys(subs, width, cap, join, dash = None, phase = 0.0):
                         if ml > 1e-9:
                             d = hw / math.sin(half)
                             wedge = [(cx, cy), a, (cx + mx / ml * d, cy + my / ml * d), b]
-                polys.append(_norm(wedge))
+                # The wedge's signed area is hw * hw * cross / 2 (the miter tip keeps it convex), so cross is its orientation
+                polys.append(wedge if cross > 0 else wedge[::-1])
             if cap == 1 and not closed:
                 polys.append(_arc(run[0][0], run[0][1], hw))
                 polys.append(_arc(run[-1][0], run[-1][1], hw))
@@ -279,10 +287,12 @@ class Image:
         if x1 <= x0 or y1 <= y0: return
         a = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd) * alpha
         if not a.any(): return
-        sub = self.buf[y0:y1, x0:x1]
-        a3 = a[:, :, None]
-        sub[:, :, :3] = sub[:, :, :3] * (1 - a3) + np.asarray(rgb, dtype = np.float64) * a3
-        sub[:, :, 3] = sub[:, :, 3] * (1 - a) + a
+        # Blend only the covered pixels; the edge box of a slanted linkage is mostly empty
+        ys, xs = np.nonzero(a)
+        v = a[ys, xs][:, None]
+        ys += y0
+        xs += x0
+        self.buf[ys, xs] = self.buf[ys, xs] * (1 - v) + np.append(np.asarray(rgb, dtype = np.float64), 1.0) * v
     def paint_grad(self, edges, grad, ctm, alpha, even_odd = False, box = None):
         """Fill `edges` with a radial gradient evaluated per pixel in the op's user space."""
         inv = _inv(ctm)
@@ -317,8 +327,13 @@ class Image:
     def rgb(self, background = None):
         a = self.buf[:, :, 3:4]
         if background is None:  # keep the alpha channel; the buffer is premultiplied
-            out = np.concatenate([np.divide(self.buf[:, :, :3], a, out = np.zeros_like(self.buf[:, :, :3]),
-                                            where = a > 1e-6), a], axis = 2)
+            # Un-premultiply only the inked pixels; everything else is (0, 0, 0, 0) and a figure is mostly empty page
+            out = np.zeros((self.h, self.w, 4), dtype = np.uint8)
+            ink = self.buf[:, :, 3] > 1e-6
+            px = self.buf[ink]
+            out[ink] = np.clip(np.concatenate([px[:, :3] / px[:, 3:], px[:, 3:]], axis = 1) * 255.0 + 0.5, 0,
+                               255).astype(np.uint8)
+            return out
         else:
             out = self.buf[:, :, :3] + np.asarray(background, dtype = np.float64) * (1 - a)
         return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
@@ -336,7 +351,10 @@ def encode_png(arr, texts = (), dpi = None):
     if dpi:  # pHYs, so Word, PowerPoint, and Inkscape place the PNG at the same physical size as the PDF
         out.append(chunk(b'pHYs', struct.pack('>IIB', int(round(dpi[0] / 0.0254)), int(round(dpi[1] / 0.0254)), 1)))
     for key, value in texts:
-        out.append(chunk(b'tEXt', key.encode('latin-1') + b'\x00' + value.encode('latin-1', 'replace')))
+        try:
+            out.append(chunk(b'tEXt', key.encode('latin-1') + b'\x00' + value.encode('latin-1')))
+        except UnicodeEncodeError:  # tEXt is Latin-1 only; iTXt (uncompressed, no language tag) carries UTF-8
+            out.append(chunk(b'iTXt', key.encode('latin-1') + b'\x00' * 5 + value.encode('utf-8')))
     out.append(chunk(b'IDAT', zlib.compress(raw, 6)))
     out.append(chunk(b'IEND', b''))
     return b''.join(out)

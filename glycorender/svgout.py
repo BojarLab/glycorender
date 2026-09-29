@@ -1,5 +1,6 @@
 """Emit SVG from a pdfwrite display list. Text becomes glyph outlines, so the result carries no font dependency."""
 import itertools
+import re
 from .pdfwrite import _fmt
 
 _DOC = itertools.count()  # gradient ids must stay unique when several documents are pasted into one figure
@@ -92,7 +93,8 @@ def emit(ops, width, height, shadow = None, sticker = None):
                 cut = dict(op, fill_rgb = color, stroke_rgb = color, fill_alpha = 1.0, stroke_alpha = 1.0,
                            fill_grad = None, dash = None, cap = 1, join = 1,
                            line_width = (op['line_width'] if is_path and op['stroke'] else 0.0) + 2 * grow)
-                body.append(_element(d, cut, not is_path or op['fill'], True))
+                # Chromium's stroker punches holes into glyph quads tighter than the cut is wide, so cut along their chords
+                body.append(_element(d if is_path else re.sub(r'Q \S+ \S+ ', 'L ', d), cut, not is_path or op['fill'], True))
         if shadow: body.append('</g>')
     for op, d in shapes:
         if op['kind'] == 'path':

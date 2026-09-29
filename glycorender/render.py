@@ -1,6 +1,7 @@
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="importlib._bootstrap")
 import re
+import html
 import math
 import struct
 from pathlib import Path
@@ -852,11 +853,12 @@ def _render_svg_to_pdf_canvas(svg_data: str,
     else:
         aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
         if aria_label_match:
-            current_alt_text = aria_label_match.group(1)
+            current_alt_text = html.unescape(aria_label_match.group(1))
     root = svgin.parse_xml(svg_data)
     ns = {'svg': 'http://www.w3.org/2000/svg', 'xlink': 'http://www.w3.org/1999/xlink'}
     width, height, vb_x, vb_y, scale_x, scale_y = parse_svg_dimensions(root)
-    c = canvas.Canvas(pdf_target, pagesize=(width * mm, height * mm) if width <= 20 and height <=20 else (width, height))
+    unit = mm if width <= 20 and height <= 20 else 1.0
+    c = canvas.Canvas(pdf_target, pagesize=(width * unit, height * unit))
     if current_alt_text:
         c.setTitle(current_alt_text.replace("SNFG diagram of ", "").split(" drawn in")[0])
         c.setAuthor("GlycoDraw")
@@ -865,8 +867,9 @@ def _render_svg_to_pdf_canvas(svg_data: str,
     elem_ctm = element_transforms(root)
     all_paths, all_gradients = extract_defs(root, ns, elem_ctm)
     connection_path_ids = find_connection_paths(root, all_paths, ns, elem_ctm)
-    c.translate(0, height)
-    c.scale(1, -1)
+    # A millimeter-sized page needs the drawing scaled with it, or it fills only the bottom-left 35% of the page
+    c.translate(0, height * unit)
+    c.scale(unit, -unit)
     c.translate(-vb_x * scale_x, -vb_y * scale_y)
     c.scale(scale_x, scale_y)
     draw_circles_with_gradients(c, root, all_gradients, ns, elem_ctm)
@@ -976,7 +979,7 @@ def convert_svg_to_pdf(svg_data: str, pdf_file_path: Union[str, Path], return_ca
     alt_text_payload = None
     aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
     if aria_label_match:
-        alt_text_payload = {'alt_text': aria_label_match.group(1)}
+        alt_text_payload = {'alt_text': html.unescape(aria_label_match.group(1))}
     canvas_obj = _render_svg_to_pdf_canvas(svg_data, pdf_file_path, alt_text_info = alt_text_payload)
     canvas_obj.shadow = shadow
     canvas_obj.sticker = sticker
@@ -999,7 +1002,8 @@ def convert_svg_to_png(svg_data: str, png_file_path: Union[str, Path, None] = No
     if not return_bytes and png_file_path is None:
         raise ValueError("png_file_path must be provided if return_bytes is False.")
     aria_label_match = re.search(r'aria-label=["\']([^"\']+)["\']', svg_data)
-    alt_text = aria_label_match.group(1) if aria_label_match else None
+    # glycowork HTML-escapes the label to fit it into the attribute; metadata wants the plain text back
+    alt_text = html.unescape(aria_label_match.group(1)) if aria_label_match else None
     canvas_obj = _render_svg_to_pdf_canvas(svg_data, None, alt_text_info = {'alt_text': alt_text} if alt_text else None)
     canvas_obj.shadow = shadow
     canvas_obj.sticker = sticker
