@@ -3,7 +3,7 @@ import base64, os, re, struct, zlib
 from types import SimpleNamespace
 import numpy as np
 import pytest
-from glycorender import pdfwrite, raster, ttf
+from glycorender import pdfwrite, raster, svgdraw, ttf
 from glycorender.render import (_render_svg_to_pdf_canvas, convert_svg_to_pdf, convert_svg_to_png, parse_color,
                                 parse_path, pdf_to_svg_bytes, simple_svg_to_pdf, simple_svg_to_png)
 
@@ -294,3 +294,58 @@ def test_ring_label_at_the_origin_is_drawn():
     texts = [op for op in _render_svg_to_pdf_canvas(svg, None).ops if op['kind'] == 'text']
     assert [op['text'] for op in texts] == ['b3', 'L', 'f']
     assert texts[2]['ctm'][2] != 0  # the furanose f is skewed into a faked italic
+
+
+def test_svgdraw_writes_what_drawsvg_wrote():
+    d = svgdraw.Drawing(200, 110, origin=(-150.0, -55.0))
+    g = svgdraw.Group(transform='rotate(0 -50.0 0.0)')
+    bond = svgdraw.Path(stroke_width=4.0, stroke='#000000').M(-100, 0).L(0, 0)
+    g.append(bond)
+    g.append(svgdraw.Text('b 3', 20.0, path=bond, text_anchor='middle', fill='#000000', valign='middle',
+                          line_offset=-0.5))
+    g.append(svgdraw.Rectangle(-25.0, -25.0, 50, 50, fill='#FCC326', stroke_width=2.0, stroke='#000000'))
+    g.append(svgdraw.Circle(-100, 0, 25.0, fill='#0090BC', stroke_width=2.0, stroke='#000000'))
+    d.append(g)
+    assert d.as_svg() == SNFG_SVG
+
+
+def test_svgdraw_defs_duplicates_and_text_forms():
+    # Expected output is what drawsvg 2.4 writes for the same calls
+    d = svgdraw.Drawing(10, 10, id_prefix='g_')
+    carrier = svgdraw.Path().M(0, 0).L(1, 1)
+    glow = svgdraw.RadialGradient(1, 2, 3)
+    glow.add_stop(0, 'red', opacity=0.5)
+    twice, own = svgdraw.Circle(0, 0, 1), svgdraw.Circle(0, 0, 2, id='own')
+    shape = svgdraw.Lines(0, 0, 1, 1, 2, 0, close=True).C(1, 2, 3, 4, 5, 6)
+    d.append(svgdraw.Group([svgdraw.Text('A&B', 5, path=carrier, text_anchor='end', line_offset=-3.15),
+                            svgdraw.Text('f', 5, path=carrier, center=True), svgdraw.Text('', 5, path=carrier),
+                            svgdraw.Text('a\nb', 5, 1, 2), svgdraw.Text('c', 5, 1, 2, center=True),
+                            svgdraw.Circle(1, 2, 3, fill=glow), twice, twice, own, own, shape]))
+    assert d.as_svg() == """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="10" height="10" viewBox="0 0 10 10">
+<defs>
+<path d="M0,0 L1,1" id="g_0" />
+<radialGradient cx="1" cy="2" r="3" gradientUnits="userSpaceOnUse" id="g_1">
+<stop offset="0" stop-color="red" stop-opacity="0.5" />
+</radialGradient>
+</defs>
+<g>
+<text font-size="5" text-anchor="end"><textPath xlink:href="#g_0" startOffset="100%">
+<tspan dy="-3.15em" dx="-1">A&amp;B</tspan>
+</textPath></text>
+<text font-size="5" text-anchor="middle"><textPath xlink:href="#g_0" startOffset="50%">
+<tspan dy="0.5em">f</tspan>
+</textPath></text>
+<text font-size="5"><textPath xlink:href="#g_0"></textPath></text>
+<text x="1" y="2" font-size="5"><tspan x="1" dy="0em">a</tspan><tspan x="1" dy="1em">b</tspan></text>
+<text x="1" y="2" font-size="5" text-anchor="middle" dominant-baseline="central">c</text>
+<circle cx="1" cy="2" r="3" fill="url(#g_1)" />
+<circle cx="0" cy="0" r="1" id="g_2" />
+<use xlink:href="#g_2" />
+<circle cx="0" cy="0" r="2" id="own" />
+<use xlink:href="#own" />
+<path d="M0,0 L1,1 L2,0 Z C1,2,3,4,5,6" />
+</g>
+</svg>"""
+    assert d.all_elements() == d.elements and len(_render_svg_to_pdf_canvas(d.as_svg(), None).ops) > 0
