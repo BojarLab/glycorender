@@ -3,6 +3,7 @@ import math, struct, zlib
 import numpy as np
 
 SS = 4  # vertical subsamples per pixel; horizontal coverage is analytic
+_UNIT_CIRCLES = {}
 # Cubic Bernstein weights for every step count flatten() can pick, so a curve costs four multiply-adds, not a linspace
 _BERNSTEIN = {n: ((1 - t)**3, 3*(1 - t)**2*t, 3*(1 - t)*t**2, t**3)
               for n in range(3, 65) for t in [np.linspace(0, 1, n + 1)[1:]]}
@@ -36,18 +37,21 @@ def sample_stops(stops, t):
 def flatten(ops, ctm):
     """Path ops (user space) -> list of device-space point lists, one per subpath."""
     subs, cur, start = [], [], None
+    a, b, c, d, e, f = ctm
     for op in ops:
         k = op[0]
         if k == 'm':
             if len(cur) > 1: subs.append(cur)
-            start = _apply(ctm, op[1], op[2])
+            start = (a * op[1] + c * op[2] + e, b * op[1] + d * op[2] + f)
             cur = [start]
         elif k == 'l':
-            cur.append(_apply(ctm, op[1], op[2]))
+            cur.append((a * op[1] + c * op[2] + e, b * op[1] + d * op[2] + f))
         elif k == 'c':
             if not cur: continue
             p0 = cur[-1]
-            p1, p2, p3 = _apply(ctm, op[1], op[2]), _apply(ctm, op[3], op[4]), _apply(ctm, op[5], op[6])
+            p1 = (a * op[1] + c * op[2] + e, b * op[1] + d * op[2] + f)
+            p2 = (a * op[3] + c * op[4] + e, b * op[3] + d * op[4] + f)
+            p3 = (a * op[5] + c * op[6] + e, b * op[5] + d * op[6] + f)
             span = (abs(p1[0]-p0[0]) + abs(p1[1]-p0[1]) + abs(p2[0]-p1[0]) + abs(p2[1]-p1[1])
                     + abs(p3[0]-p2[0]) + abs(p3[1]-p2[1]))
             b0, b1, b2, b3 = _BERNSTEIN[min(64, max(3, int(span / 3.0) + 3))]
@@ -62,16 +66,21 @@ def flatten(ops, ctm):
 
 def _edges(subs, close):
     """Device-space subpaths -> (n,4) edge array, dropping horizontal edges."""
-    out = []
-    for pts in subs:
-        p = np.asarray(pts, dtype = np.float64)
-        if close and (p[0, 0] != p[-1, 0] or p[0, 1] != p[-1, 1]):
-            p = np.vstack([p, p[:1]])
-        if len(p) < 2: continue
-        seg = np.hstack([p[:-1], p[1:]])
-        out.append(seg[seg[:, 1] != seg[:, 3]])
-    if not out: return np.zeros((0, 4))
-    return np.vstack(out)
+    # One array for all subpaths, closed where needed, without the segments that would join one subpath to the next;
+    # an array per subpath cost more than the edges themselves for the many small quads and wedges of a stroke
+    pts, ends = [], []
+    for sub in subs:
+        pts.extend(sub)
+        if close and (sub[0][0] != sub[-1][0] or sub[0][1] != sub[-1][1]):
+            pts.append(sub[0])
+        ends.append(len(pts) - 1)
+    if len(pts) < 2: return np.zeros((0, 4))
+    p = np.array(pts, dtype = np.float64)
+    seg = np.empty((len(p) - 1, 4))
+    seg[:, :2], seg[:, 2:] = p[:-1], p[1:]
+    keep = seg[:, 1] != seg[:, 3]
+    keep[ends[:-1]] = False
+    return seg[keep]
 
 
 def coverage(edges, x0, y0, w, h, even_odd = False):
@@ -80,30 +89,34 @@ def coverage(edges, x0, y0, w, h, even_odd = False):
     Each pixel row is sampled at SS sub-scanlines; within a row the crossings are
     splatted at fractional x, so horizontal antialiasing is exact rather than sampled.
     """
-    cov = np.zeros((h, w), dtype = np.float64)
-    if not len(edges) or w <= 0 or h <= 0: return cov
+    if not len(edges) or w <= 0 or h <= 0: return np.zeros((h, w), dtype = np.float64)
     ex0, ey0, ex1, ey1 = edges[:, 0], edges[:, 1], edges[:, 2], edges[:, 3]
     dirs = np.where(ey1 > ey0, 1.0, -1.0)
     slope = (ex1 - ex0) / (ey1 - ey0)
     rows = h * SS
     ys = y0 + (np.arange(rows) + 0.5) / SS
     # Each edge only tests the sub-scanlines its y-range spans (plus one of slack each side, which the exact test
-    # drops), instead of every edge against every scanline; the (row, edge) order of np.nonzero is kept
-    lo = np.clip(np.floor((np.minimum(ey0, ey1) - y0) * SS - 0.5).astype(np.intp) - 1, 0, rows)
-    n = np.clip(np.ceil((np.maximum(ey0, ey1) - y0) * SS - 0.5).astype(np.intp) + 1, 0, rows) - lo
+    # drops), instead of every edge against every scanline; the bounds are integers, so min/max stand in for np.clip,
+    # whose Python wrapper costs more than the work here
+    lo = np.minimum(np.maximum(np.floor((np.minimum(ey0, ey1) - y0) * SS - 0.5).astype(np.intp) - 1, 0), rows)
+    n = np.minimum(np.maximum(np.ceil((np.maximum(ey0, ey1) - y0) * SS - 0.5).astype(np.intp) + 1, 0), rows) - lo
     n = np.maximum(n, 0)
     ei = np.repeat(np.arange(len(edges)), n)
     ri = np.arange(len(ei)) - np.repeat(np.cumsum(n) - n, n) + lo[ei]
     keep = (ey0[ei] <= ys[ri]) != (ey1[ei] <= ys[ri])
     ri, ei = ri[keep], ei[keep]
-    order = np.lexsort((ei, ri))
-    ri, ei = ri[order], ei[order]
+    # Crossings come edge by edge, so within each sub-scanline they are already in edge order, which is all that
+    # bincount's per-bin accumulation order depends on (a bin never spans two sub-scanlines); no sort is needed
     chunk = max(SS, int(4e6 // (w + 2)) // SS * SS)
+    cov = np.zeros((h, w), dtype = np.float64) if rows > chunk or not len(ri) else None
     for r0 in range(0, rows, chunk):
         r1 = min(rows, r0 + chunk)
-        a, b = np.searchsorted(ri, (r0, r1))
-        if a == b: continue
-        cr, ce = ri[a:b], ei[a:b]
+        if cov is None:
+            cr, ce = ri, ei
+        else:
+            sel = (ri >= r0) & (ri < r1)
+            if not sel.any(): continue
+            cr, ce = ri[sel], ei[sel]
         xs = ex0[ce] + (ys[cr] - ey0[ce]) * slope[ce]
         xs = np.clip(xs - x0, 0.0, float(w))
         ix = np.floor(xs).astype(np.intp)
@@ -113,20 +126,30 @@ def coverage(edges, x0, y0, w, h, even_odd = False):
         flat = (cr - r0) * (w + 2) + ix
         acc = np.bincount(np.concatenate([flat, flat + 1]), np.concatenate([d * (1.0 - frac), d * frac]),
                           (r1 - r0) * (w + 2)).reshape(r1 - r0, w + 2)
-        wind = np.cumsum(acc, axis = 1)[:, :w]
+        wind = np.cumsum(acc, axis = 1, out = acc)[:, :w]
         if even_odd:
             m = np.abs(wind) % 2.0
             band = np.minimum(m, 2.0 - m)
         else:
-            band = np.clip(np.abs(wind), 0.0, 1.0)
+            band = np.minimum(np.abs(wind, out = wind), 1.0, out = wind)
+        if cov is None:
+            # Each row is the mean of SS bands in [0, 1], so it is in [0, 1] itself and needs no clipping
+            cov = band.reshape(-1, SS, w).sum(axis = 1)
+            cov /= SS
+            return cov
         cov[r0 // SS:r1 // SS] += band.reshape(-1, SS, w).sum(axis = 1) / SS
     return np.clip(cov, 0.0, 1.0)
 
 
 def _arc(cx, cy, r):
-    # Facet count grows with the radius, keeping the sagitta under 0.1 px at any zoom
-    t = np.linspace(0, 2 * math.pi, max(16, int(7 * math.sqrt(r))), endpoint = False)
-    return list(zip((cx + r * np.cos(t)).tolist(), (cy + r * np.sin(t)).tolist()))
+    # Facet count grows with the radius, keeping the sagitta under 0.1 px at any zoom; the facet angles depend only on
+    # their count, so their cosines and sines are computed once per count
+    n = max(16, int(7 * math.sqrt(r)))
+    if n not in _UNIT_CIRCLES:
+        t = np.linspace(0, 2 * math.pi, n, endpoint = False)
+        _UNIT_CIRCLES[n] = (np.cos(t), np.sin(t))
+    cos, sin = _UNIT_CIRCLES[n]
+    return list(zip((cx + r * cos).tolist(), (cy + r * sin).tolist()))
 
 
 def _dash(pts, pattern, phase):
@@ -204,7 +227,13 @@ def stroke_polys(subs, width, cap, join, dash = None, phase = 0.0):
                     turn = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
                     s = math.pi / 2 if turn > 0 else -math.pi / 2
                     n = max(2, int(math.ceil(abs(turn) / (2 * math.pi) * max(16, int(7 * math.sqrt(hw))))) + 1)
-                    t = np.linspace(a1 - s, a1 - s + turn, n + 1)
+                    # np.linspace(a1 - s, a1 - s + turn, n + 1) element for element, without its overhead; linspace
+                    # only differs for a step that underflows to zero, which a turn (0, or at least an ulp of pi) over n
+                    # never is
+                    start, stop = a1 - s, a1 - s + turn
+                    t = np.arange(n + 1, dtype = np.float64) * ((stop - start) / n)
+                    t += start
+                    t[-1] = stop
                     fan = [(cx, cy)] + list(zip((cx + hw * np.cos(t)).tolist(), (cy + hw * np.sin(t)).tolist()))
                     polys.append(fan if turn > 0 else fan[::-1])
                     continue
@@ -281,33 +310,38 @@ def _glyph_paths(op, ctm):
 
 class Image:
     def __init__(self, w, h):
-        """Premultiplied float RGBA accumulation buffer."""
+        """Premultiplied float RGBA accumulation buffer, one plane per channel, so that every blend runs along rows
+        instead of across four channels."""
         self.w, self.h = w, h
-        self.buf = np.zeros((h, w, 4), dtype = np.float64)
+        self.buf = np.zeros((4, h, w), dtype = np.float64)
     def paint(self, edges, rgb, alpha, even_odd = False, box = None):
         if not len(edges) or alpha <= 0: return
         lo = box[:2] if box else (-1e9, -1e9)
         hi = box[2:] if box else (1e9, 1e9)
-        x0 = max(0, int(math.floor(max(edges[:, [0, 2]].min(), lo[0]))))
-        x1 = min(self.w, int(math.ceil(min(edges[:, [0, 2]].max(), hi[0]))) + 1)
-        y0 = max(0, int(math.floor(max(edges[:, [1, 3]].min(), lo[1]))))
-        y1 = min(self.h, int(math.ceil(min(edges[:, [1, 3]].max(), hi[1]))) + 1)
+        xe, ye = edges[:, 0::2], edges[:, 1::2]
+        x0 = max(0, int(math.floor(max(xe.min(), lo[0]))))
+        x1 = min(self.w, int(math.ceil(min(xe.max(), hi[0]))) + 1)
+        y0 = max(0, int(math.floor(max(ye.min(), lo[1]))))
+        y1 = min(self.h, int(math.ceil(min(ye.max(), hi[1]))) + 1)
         if x1 <= x0 or y1 <= y0: return
-        a = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd) * alpha
-        ys, xs = np.nonzero(a)
-        if not len(ys): return
+        a = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd)
+        if alpha != 1:
+            a *= alpha
+        covered = np.count_nonzero(a)
+        if not covered: return
         col = np.append(np.asarray(rgb, dtype = np.float64), 1.0)
         # A mostly covered box (a figure or axes background, a square symbol) blends fastest as one slice
-        if 2 * len(ys) > a.size:
-            a3, sub = a[:, :, None], self.buf[y0:y1, x0:x1]
-            sub *= 1 - a3
-            sub += col * a3
+        if 2 * covered > a.size:
+            sub = self.buf[:, y0:y1, x0:x1]
+            sub *= 1 - a
+            sub += col[:, None, None] * a
             return
         # Otherwise blend only the covered pixels; the edge box of a slanted linkage is mostly empty
-        v = a[ys, xs][:, None]
+        ys, xs = np.nonzero(a)
+        v = a[ys, xs]
         ys += y0
         xs += x0
-        self.buf[ys, xs] = self.buf[ys, xs] * (1 - v) + col * v
+        self.buf[:, ys, xs] = self.buf[:, ys, xs] * (1 - v) + col[:, None] * v
     def paint_grad(self, edges, grad, ctm, alpha, even_odd = False, box = None):
         """Fill `edges` with a radial gradient evaluated per pixel in the op's user space."""
         inv = _inv(ctm)
@@ -335,23 +369,38 @@ class Image:
             t = ((ux - ax) * dx + (uy - ay) * dy) / (span if span > 1e-12 else 1e-12)
         cr, cg, cb, ca = sample_stops(stops, t)
         a = cov * ca * alpha
-        sub = self.buf[y0:y1, x0:x1]
-        a3 = a[:, :, None]
-        sub[:, :, :3] = sub[:, :, :3] * (1 - a3) + np.dstack([cr, cg, cb]) * a3
-        sub[:, :, 3] = sub[:, :, 3] * (1 - a) + a
+        sub = self.buf[:, y0:y1, x0:x1]
+        sub[:3] = sub[:3] * (1 - a) + np.stack([cr, cg, cb]) * a
+        sub[3] = sub[3] * (1 - a) + a
     def rgb(self, background = None):
-        a = self.buf[:, :, 3:4]
+        # Only the inked pixels are computed, gathered by flat index, as a figure is mostly empty page
+        flat = self.buf.reshape(4, -1)
         if background is None:  # keep the alpha channel; the buffer is premultiplied
-            # Un-premultiply only the inked pixels; everything else is (0, 0, 0, 0) and a figure is mostly empty page
-            out = np.zeros((self.h, self.w, 4), dtype = np.uint8)
-            ink = self.buf[:, :, 3] > 1e-6
-            px = self.buf[ink]
-            out[ink] = np.clip(np.concatenate([px[:, :3] / px[:, 3:], px[:, 3:]], axis = 1) * 255.0 + 0.5, 0,
-                               255).astype(np.uint8)
-            return out
-        else:
-            out = self.buf[:, :, :3] + np.asarray(background, dtype = np.float64) * (1 - a)
-        return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
+            # Un-premultiply only the inked pixels; everything else is (0, 0, 0, 0)
+            out = np.zeros((self.h * self.w, 4), dtype = np.uint8)
+            idx = np.flatnonzero(flat[3] > 1e-6)
+            px = flat[:, idx]
+            v = np.empty((len(idx), 4))
+            v[:, :3] = (px[:3] / px[3]).T
+            v[:, 3] = px[3]
+            v *= 255.0
+            v += 0.5
+            out[idx] = np.clip(v, 0, 255, out = v).astype(np.uint8)
+            return out.reshape(self.h, self.w, 4)
+        # Untouched pixels hold zero colour and zero alpha, so they come out as the background colour itself
+        bg = np.asarray(background, dtype = np.float64)
+        # Filled a whole row at a time, as broadcasting three bytes per pixel is several times slower
+        out = np.empty((self.h, self.w * 3), dtype = np.uint8)
+        out[...] = np.tile(np.clip(bg * 255.0 + 0.5, 0, 255).astype(np.uint8), self.w)
+        out = out.reshape(-1, 3)
+        idx = np.flatnonzero(flat[3] != 0)
+        px = flat[:, idx]
+        v = (1 - px[3]) * bg[:, None]
+        v += px[:3]
+        v *= 255.0
+        v += 0.5
+        out[idx] = np.clip(v, 0, 255, out = v).astype(np.uint8).T
+        return out.reshape(self.h, self.w, 3)
 
 
 def encode_png(arr, texts = (), dpi = None):
@@ -452,15 +501,14 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
         mask = _box_blur(_ink_mask(ops, w, h, flip, shadow['dx'] * sc, shadow['dy'] * sc, grow, not sticker),
                          max(1, int(round(shadow['blur'] * sc))))
         a = np.clip(mask * shadow['alpha'], 0.0, 1.0)
-        img.buf[:, :, :3] = np.asarray(shadow['color'], dtype = np.float64) * a[:, :, None]
-        img.buf[:, :, 3] = a
+        img.buf[:3] = np.asarray(shadow['color'], dtype = np.float64)[:, None, None] * a
+        img.buf[3] = a
     if sticker:
         layers = [(sticker['width'] + sticker['edge'], sticker['edge_color'])] if sticker['edge'] > 0 else []
         for grow, color in layers + [(sticker['width'], sticker['color'])]:
             a = np.clip(_ink_mask(ops, w, h, flip, 0.0, 0.0, grow * sc, False), 0.0, 1.0)
-            a3 = a[:, :, None]
-            img.buf[:, :, :3] = img.buf[:, :, :3] * (1 - a3) + np.asarray(color, dtype = np.float64) * a3
-            img.buf[:, :, 3] = img.buf[:, :, 3] * (1 - a) + a
+            img.buf[:3] = img.buf[:3] * (1 - a) + np.asarray(color, dtype = np.float64)[:, None, None] * a
+            img.buf[3] = img.buf[3] * (1 - a) + a
     for op in ops:
         ctm = _mul(op['ctm'], flip)
         if _inv(ctm) is None: continue
@@ -496,9 +544,10 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
             if op['alpha'] is not None:
                 a = a * np.frombuffer(op['alpha'], np.uint8).reshape(op['h'], op['w'])[row, col] / 255.0
             a3, sub = a[:, :, None], img.buf[y0:y1, x0:x1]
-            sub[:, :, :3] = sub[:, :, :3] * (1 - a3) + np.frombuffer(op['rgb'], np.uint8).reshape(
-                op['h'], op['w'], 3)[row, col] / 255.0 * a3
-            sub[:, :, 3] = sub[:, :, 3] * (1 - a) + a
+            sub = img.buf[:, y0:y1, x0:x1]
+            sub[:3] = sub[:3] * (1 - a) + np.frombuffer(op['rgb'], np.uint8).reshape(
+                op['h'], op['w'], 3)[row, col].transpose(2, 0, 1) / 255.0 * a
+            sub[3] = sub[3] * (1 - a) + a
         else:
             subs = []
             for cmds, gctm in _glyph_paths(op, ctm):
