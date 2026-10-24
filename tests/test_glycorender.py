@@ -190,6 +190,18 @@ def test_svg_output_carries_the_cut_layer():
     assert 'stroke="#FFFFFF"' in cut and cut.index('#FFFFFF') < cut.index('#FCC326')  # cut sits behind the ink
 
 
+def test_svg_output_writes_shared_transform_and_cut_paint_once():
+    plain, cut = _canvas().to_svg(), _canvas(sticker = True).to_svg()
+    edged = _canvas(sticker = {'edge': 2.0}).to_svg()
+    assert cut.split('\n')[1] == edged.split('\n')[1] == plain.split('\n')[1]  # the <svg> element: same size either way
+    # The drawing's group applies the transform the shapes share; only the label, turned upright, keeps one (cut and ink).
+    # So the cut's shadow is cast in the shapes' own unflipped space and falls down the page, as in the PNG and PDF
+    assert cut.count('transform="matrix(') == 3 and '<g transform="matrix(1 0 0 1 ' in cut
+    # A cut layer's group carries its paint, so its pieces carry only geometry and width
+    assert cut.count('stroke="#FFFFFF"') == 1 and cut.count('fill="none"') == 2
+    assert edged.count('<g fill=') == 2 and edged.count('<g filter=') == 1  # keyline and cut share one shadow
+
+
 def test_pdf_to_svg_bytes_passes_effects_through():
     assert 'feDropShadow' in pdf_to_svg_bytes(SNFG_SVG, sticker = True)
     assert 'feDropShadow' not in pdf_to_svg_bytes(SNFG_SVG)

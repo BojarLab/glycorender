@@ -1,7 +1,8 @@
 """Emit SVG from a pdfwrite display list. Text becomes glyph outlines, so the result carries no font dependency."""
 import itertools
 import re
-from .pdfwrite import _fmt
+from collections import Counter
+from .pdfwrite import _fmt, _inv, _mul
 
 _DOC = itertools.count()  # gradient ids must stay unique when several documents are pasted into one figure
 
@@ -31,11 +32,16 @@ def _gradient(op, grads, prefix):
     return 'url(#%s)' % grads[key]
 
 
-def _element(d, op, fill, stroke, grads = None, prefix = ''):
-    attrs = ['d="%s"' % d]
-    ctm = op['ctm']
-    if ctm != (1.0, 0.0, 0.0, 1.0, 0.0, 0.0):
-        attrs.append('transform="matrix(%s)"' % ' '.join(_fmt(v) for v in ctm))
+def _shape(d, op, undo):
+    """A path's geometry, with a transform only where its own differs from the one its document's group applies."""
+    ctm = tuple(round(v, 9) for v in _mul(op['ctm'], undo))
+    if ctm == (1.0, 0.0, 0.0, 1.0, 0.0, 0.0):
+        return 'd="%s"' % d
+    return 'd="%s" transform="matrix(%s)"' % (d, ' '.join(_fmt(v) for v in ctm))
+
+
+def _element(d, op, fill, stroke, undo, grads = None, prefix = ''):
+    attrs = [_shape(d, op, undo)]
     if fill:
         attrs.append('fill="%s"' % (_gradient(op, grads, prefix) if op.get('fill_grad') and grads is not None
                                     else _hex(op['fill_rgb'])))
@@ -83,27 +89,35 @@ def emit(ops, width, height, shadow = None, sticker = None):
                 if n + 1 < len(gids):
                     pen += ttf.kern(gid, gids[n + 1]) * k
             if segs: shapes.append((op, ' '.join(segs)))
+    # Shapes mostly share one transform: the drawing's group applies it, so that they need none of their own
+    common = Counter(op['ctm'] for op, _ in shapes).most_common(1)[0][0] if shapes else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    undo = _inv(common)
     if sticker:
         layers = [(sticker['width'] + sticker['edge'], sticker['edge_color'])] if sticker['edge'] > 0 else []
         if shadow: body.append(
             '<g filter="url(#%sshadow)">' % prefix)  # one shadow for the whole cut, not one per piece
         for grow, color in layers + [(sticker['width'], sticker['color'])]:
+            # Every piece of a layer has the same paint, so the layer's group carries it
+            body.append('<g fill="%s" stroke="%s" stroke-linecap="round" stroke-linejoin="round">'
+                        % (_hex(color), _hex(color)))
             for op, d in shapes:
                 is_path = op['kind'] == 'path'
-                cut = dict(op, fill_rgb = color, stroke_rgb = color, fill_alpha = 1.0, stroke_alpha = 1.0,
-                           fill_grad = None, dash = None, cap = 1, join = 1,
-                           line_width = (op['line_width'] if is_path and op['stroke'] else 0.0) + 2 * grow)
+                filled = not is_path or op['fill']
+                line = (op['line_width'] if is_path and op['stroke'] else 0.0) + 2 * grow
                 # Chromium's stroker punches holes into glyph quads tighter than the cut is wide, so cut along their chords
-                body.append(_element(d if is_path else re.sub(r'Q \S+ \S+ ', 'L ', d), cut, not is_path or op['fill'], True))
+                body.append('<path %s%s stroke-width="%s" />' % (
+                    _shape(d if is_path else re.sub(r'Q \S+ \S+ ', 'L ', d), op, undo),
+                    (' fill-rule="evenodd"' if op.get('even_odd') else '') if filled else ' fill="none"', _fmt(line)))
+            body.append('</g>')
         if shadow: body.append('</g>')
     for op, d in shapes:
         if op['kind'] == 'path':
-            el = _element(d, op, op['fill'], op['stroke'], grads, prefix)
+            el = _element(d, op, op['fill'], op['stroke'], undo, grads = grads, prefix = prefix)
             if shadow and not sticker and op['fill'] and op['stroke']:
                 el = el.replace('<path ', '<path filter="url(#%sshadow)" ' % prefix, 1)
             body.append(el)
         else:
-            body.append(_element(d, op, True, False))
+            body.append(_element(d, op, True, False, undo))
     defs, entries = '', []
     if grads:
         for (kind, geo, stops), name in grads.items():
@@ -124,5 +138,6 @@ def emit(ops, width, height, shadow = None, sticker = None):
         defs = '<defs>%s</defs>\n' % defs
     return ('<?xml version="1.0" encoding="UTF-8"?>\n'
             '<svg xmlns="http://www.w3.org/2000/svg" width="%s" height="%s" viewBox="0 0 %s %s">\n'
-            '%s<g transform="matrix(1 0 0 -1 0 %s)">\n%s\n</g>\n</svg>\n'
-            % (_fmt(width), _fmt(height), _fmt(width), _fmt(height), defs, _fmt(height), '\n'.join(body)))
+            '%s<g transform="matrix(%s)">\n%s\n</g>\n</svg>\n'
+            % (_fmt(width), _fmt(height), _fmt(width), _fmt(height), defs,
+               ' '.join(_fmt(v) for v in _mul(common, (1.0, 0.0, 0.0, -1.0, 0.0, height))), '\n'.join(body)))
