@@ -10,14 +10,16 @@ _CAP = {0: 'butt', 1: 'round', 2: 'square'}
 _JOIN = {0: 'miter', 1: 'round', 2: 'bevel'}
 
 
+def _num(v):
+    """A path coordinate to a hundredth of a unit: 1/7200 inch at the drawing's own size, far below anything visible."""
+    s = ('%.2f' % v).rstrip('0').rstrip('.')
+    return '0' if s == '-0' else s
+
+
 def _d(ops):
-    out = []
-    for seg in ops:
-        if seg[0] == 'h':
-            out.append('Z')
-        else:
-            out.append({'m': 'M', 'l': 'L', 'c': 'C'}[seg[0]] + ' ' + ' '.join(_fmt(v) for v in seg[1:]))
-    return ' '.join(out)
+    # Each command letter runs into its first number, which every SVG reader parses and saves a fifth of the bytes
+    return ''.join('Z' if seg[0] == 'h' else {'m': 'M', 'l': 'L', 'c': 'C'}[seg[0]] + ' '.join(_num(v) for v in seg[1:])
+                   for seg in ops)
 
 
 def _hex(rgb):
@@ -81,14 +83,16 @@ def emit(ops, width, height, shadow = None, sticker = None):
             for n, gid in enumerate(gids):
                 k = op['size'] / ttf.units_per_em
                 for cmd, a in ttf.outline(gid):
-                    if cmd == 'M': segs.append('M ' + _fmt(a[0]*k + pen) + ' ' + _fmt(a[1]*k + op['y']))
-                    elif cmd == 'L': segs.append('L ' + _fmt(a[0]*k + pen) + ' ' + _fmt(a[1]*k + op['y']))
-                    elif cmd == 'Q': segs.append('Q ' + ' '.join(_fmt(v) for v in (a[0]*k+pen, a[1]*k+op['y'], a[2]*k+pen, a[3]*k+op['y'])))
+                    if cmd == 'M': segs.append('M' + _num(a[0]*k + pen) + ' ' + _num(a[1]*k + op['y']))
+                    elif cmd == 'L': segs.append('L' + _num(a[0]*k + pen) + ' ' + _num(a[1]*k + op['y']))
+                    elif cmd == 'Q':
+                        segs.append('Q' + ' '.join(_num(v) for v in (a[0]*k + pen, a[1]*k + op['y'], a[2]*k + pen,
+                                                                     a[3]*k + op['y'])))
                     elif cmd == 'Z': segs.append('Z')
                 pen += ttf.width(gid) * op['size'] / 1000.0 + op['char_space']
                 if n + 1 < len(gids):
                     pen += ttf.kern(gid, gids[n + 1]) * k
-            if segs: shapes.append((op, ' '.join(segs)))
+            if segs: shapes.append((op, ''.join(segs)))
     # Shapes mostly share one transform: the drawing's group applies it, so that they need none of their own
     common = Counter(op['ctm'] for op, _ in shapes).most_common(1)[0][0] if shapes else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
     undo = _inv(common)
@@ -106,7 +110,7 @@ def emit(ops, width, height, shadow = None, sticker = None):
                 line = (op['line_width'] if is_path and op['stroke'] else 0.0) + 2 * grow
                 # Chromium's stroker punches holes into glyph quads tighter than the cut is wide, so cut along their chords
                 body.append('<path %s%s stroke-width="%s" />' % (
-                    _shape(d if is_path else re.sub(r'Q \S+ \S+ ', 'L ', d), op, undo),
+                    _shape(d if is_path else re.sub(r'Q\S+ \S+ ', 'L', d), op, undo),
                     (' fill-rule="evenodd"' if op.get('even_odd') else '') if filled else ' fill="none"', _fmt(line)))
             body.append('</g>')
         if shadow: body.append('</g>')

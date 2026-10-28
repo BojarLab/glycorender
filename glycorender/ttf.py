@@ -203,6 +203,14 @@ def subset(font, gids):
         if tag in tables:
             o, ln = tables[tag]
             out[tag] = d[o:o+ln]
+    # Metrics of the glyphs left out are zeroed, which compresses to nothing: a third of a subset font was metrics of
+    # glyphs it does not have. The last full record stays, as every glyph after it shares its advance
+    num_h = struct.unpack('>H', d[tables['hhea'][0]+34:tables['hhea'][0]+36])[0]
+    hmtx = bytearray(len(out['hmtx']))
+    for gid in keep | {num_h - 1}:
+        at, size = (4 * gid, 4) if gid < num_h else (4 * num_h + 2 * (gid - num_h), 2)
+        hmtx[at:at+size] = out['hmtx'][at:at+size]
+    out['hmtx'] = bytes(hmtx)
     out['head'] = out['head'][:50] + struct.pack('>h', 1) + out['head'][52:]  # loca is now long format
     tags = sorted(out)
     header = struct.pack('>IHHHH', 0x00010000, len(tags), 0, 0, 0)

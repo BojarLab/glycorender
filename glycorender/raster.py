@@ -83,62 +83,142 @@ def _edges(subs, close):
     return seg[keep]
 
 
-def coverage(edges, x0, y0, w, h, even_odd = False):
+def _loops(*loops):
+    """Closed (n,2) point arrays -> (n,4) edge array, dropping horizontal edges."""
+    seg = np.vstack([np.hstack([p, np.roll(p, -1, axis = 0)]) for p in loops])
+    return seg[seg[:, 1] != seg[:, 3]]
+
+
+def _convex(sub):
+    """A device-space subpath, closed or not, as an (n,2) array turning left at every vertex; None unless convex."""
+    p = np.array([q for i, q in enumerate(sub) if i == 0 or q != sub[i - 1]], dtype = np.float64)
+    if len(p) > 1 and (p[0] == p[-1]).all(): p = p[:-1]
+    if len(p) < 3: return None
+    for _ in range(2):
+        e = np.roll(p, -1, axis = 0) - p
+        nxt = np.roll(e, -1, axis = 0)
+        turn = np.arctan2(e[:, 0] * nxt[:, 1] - e[:, 1] * nxt[:, 0], (e * nxt).sum(axis = 1))
+        if turn.sum() > 0: break
+        p = p[::-1]
+    # No turn the other way beyond rounding, and one revolution in all
+    return p if turn.min() >= -1e-9 and abs(turn.sum() - 2 * math.pi) <= 1e-6 else None
+
+
+def _outline(subs, hw, cap, join, filled = False):
+    """Edges of the stroke of one convex closed subpath, or of one segment, whose winding is only ever 0 or 1.
+
+    The stroke of a convex polygon is its outer offset less its inner offset, an annulus; `filled` asks for the outer
+    offset alone, the union of fill and stroke. A segment, retraced and closed as draw_path leaves a linkage, strokes
+    into a capsule. Anything else, open, concave or more than one subpath, is None and goes to stroke_polys.
+    """
+    if len(subs) != 1: return None
+    pts = [q for i, q in enumerate(subs[0]) if i == 0 or q != subs[0][i - 1]]
+    closed = len(pts) > 2 and pts[0] == pts[-1]
+    if len(pts) == 2 or len(pts) == 3 and closed:
+        (ax, ay), (bx, by) = pts[0], pts[1]
+        ln = math.hypot(bx - ax, by - ay)
+        ux, uy = (bx - ax) / ln, (by - ay) / ln
+        if (join if closed else cap) == 1:
+            # The half discs that the round joins of a retraced segment draw, facet for facet
+            n = max(2, int(math.ceil(0.5 * max(16, int(7 * math.sqrt(hw)))))) + 1
+            t = math.atan2(uy, ux) - math.pi / 2 + np.arange(n + 1) * (math.pi / n)
+            ring = np.column_stack([np.cos(t), np.sin(t)]) * hw
+            return _loops(np.vstack([ring + (bx, by), (ax, ay) - ring]))
+        ext = hw if cap == 2 and not closed else 0.0
+        ax, ay, bx, by = ax - ux * ext, ay - uy * ext, bx + ux * ext, by + uy * ext
+        return _loops(np.array([(ax + uy * hw, ay - ux * hw), (bx + uy * hw, by - ux * hw),
+                                (bx - uy * hw, by + ux * hw), (ax - uy * hw, ay + ux * hw)]))
+    p = _convex(pts) if closed else None
+    if p is None: return None
+    # Edge i runs from p[i] to p[i + 1]; for a polygon turning left its outward normal is on the right
+    e = np.roll(p, -1, axis = 0) - p
+    nrm = np.column_stack([e[:, 1], -e[:, 0]]) / np.hypot(e[:, 0], e[:, 1])[:, None]
+    prev = np.roll(nrm, 1, axis = 0)
+    cos = np.clip((prev * nrm).sum(axis = 1), -1.0, 1.0)
+    if join == 1:
+        # Each vertex's arc, faceted like the fan stroke_polys gives a round join
+        turn = np.maximum(np.arctan2(prev[:, 0] * nrm[:, 1] - prev[:, 1] * nrm[:, 0], cos), 0.0)
+        n = np.maximum(2, np.ceil(turn / (2 * math.pi) * max(16, int(7 * math.sqrt(hw)))).astype(np.intp)) + 1
+        k = np.arange(n.sum() + len(n)) - np.repeat(np.cumsum(n + 1) - n - 1, n + 1)
+        t = np.repeat(np.arctan2(prev[:, 1], prev[:, 0]), n + 1) + k * np.repeat(turn / n, n + 1)
+        outer = np.repeat(p, n + 1, axis = 0) + np.column_stack([np.cos(t), np.sin(t)]) * hw
+    else:
+        # A miter within the limit is the one point where the offset edges meet, anything else the ends of a bevel
+        miter = (np.sin((math.pi - np.arccos(cos)) / 2.0) >= 0.1) & (join == 0)
+        outer = np.where(miter[:, None], p + (prev + nrm) * (hw / (1.0 + cos))[:, None], p + prev * hw)
+        outer = np.insert(outer, np.flatnonzero(~miter) + 1, (p + nrm * hw)[~miter], axis = 0)
+    if filled: return _loops(outer)
+    inner = p - (prev + nrm) * (hw / (1.0 + cos))[:, None]
+    # The inner offset is the polygon eroded, valid only while none of its edges vanishes or turns around
+    if ((np.roll(inner, -1, axis = 0) - inner) * e).sum(axis = 1).min() <= 0: return None
+    return _loops(outer, inner[::-1])
+
+
+def coverage(edges, x0, y0, w, h, even_odd = False, simple = False):
     """Antialiased coverage of `edges` over the pixel box at (x0,y0), size (w,h).
 
     Each pixel row is sampled at SS sub-scanlines; within a row the crossings are
     splatted at fractional x, so horizontal antialiasing is exact rather than sampled.
+    `simple` promises a winding number that is only ever 0 or one sign of 1 (a convex
+    polygon, an annulus), so the sub-scanlines can be summed before the running sum.
     """
     if not len(edges) or w <= 0 or h <= 0: return np.zeros((h, w), dtype = np.float64)
     ex0, ey0, ex1, ey1 = edges[:, 0], edges[:, 1], edges[:, 2], edges[:, 3]
-    dirs = np.where(ey1 > ey0, 1.0, -1.0)
-    slope = (ex1 - ex0) / (ey1 - ey0)
     rows = h * SS
-    ys = y0 + (np.arange(rows) + 0.5) / SS
-    # Each edge only tests the sub-scanlines its y-range spans (plus one of slack each side, which the exact test
-    # drops), instead of every edge against every scanline; the bounds are integers, so min/max stand in for np.clip,
-    # whose Python wrapper costs more than the work here
-    lo = np.minimum(np.maximum(np.floor((np.minimum(ey0, ey1) - y0) * SS - 0.5).astype(np.intp) - 1, 0), rows)
-    n = np.minimum(np.maximum(np.ceil((np.maximum(ey0, ey1) - y0) * SS - 0.5).astype(np.intp) + 1, 0), rows) - lo
-    n = np.maximum(n, 0)
-    ei = np.repeat(np.arange(len(edges)), n)
-    ri = np.arange(len(ei)) - np.repeat(np.cumsum(n) - n, n) + lo[ei]
-    keep = (ey0[ei] <= ys[ri]) != (ey1[ei] <= ys[ri])
-    ri, ei = ri[keep], ei[keep]
+    # An edge crosses the sub-scanlines y0 + (r + 0.5) / SS in [min(ey0, ey1), max(ey0, ey1)): the estimate of the first
+    # one is off by at most one either way, and testing the two rows from one below it settles it exactly, per edge
+    # rather than per crossing; the bounds are integers, so min/max stand in for np.clip, whose wrapper costs more
+    def first(v):
+        c = np.ceil((v - y0) * SS - 0.5).astype(np.intp) - 1
+        return np.minimum(np.maximum(c + (y0 + (c + 0.5) / SS < v) + (y0 + (c + 1.5) / SS < v), 0), rows)
+    lo = first(np.minimum(ey0, ey1))
+    n = first(np.maximum(ey0, ey1)) - lo
+    # Every crossing found is real, so its edge's values come by np.repeat, which copies runs, rather than by an index
+    ri = np.arange(n.sum()) - np.repeat(np.cumsum(n) - n - lo, n)
     # Crossings come edge by edge, so within each sub-scanline they are already in edge order, which is all that
     # bincount's per-bin accumulation order depends on (a bin never spans two sub-scanlines); no sort is needed
+    xs = np.repeat(ex0, n) + (y0 + (ri + 0.5) / SS - np.repeat(ey0, n)) * np.repeat((ex1 - ex0) / (ey1 - ey0), n)
+    xs -= x0
+    np.clip(xs, 0.0, float(w), out = xs)
+    ix = np.floor(xs).astype(np.intp)
+    xs -= ix
+    d = np.repeat(np.where(ey1 > ey0, 1.0, -1.0), n)
+    hi = d * xs
+    if simple:
+        # Summed over its sub-scanlines first, a pixel row needs one running sum instead of SS
+        ri //= SS
+        rows = h
+    flat = ri * (w + 2) + ix
+    # bincount accumulates in input order exactly like np.add.at, at a fraction of the cost
     chunk = max(SS, int(4e6 // (w + 2)) // SS * SS)
-    cov = np.zeros((h, w), dtype = np.float64) if rows > chunk or not len(ri) else None
+    cov = np.zeros((h, w), dtype = np.float64) if rows > chunk else None
     for r0 in range(0, rows, chunk):
         r1 = min(rows, r0 + chunk)
         if cov is None:
-            cr, ce = ri, ei
+            cf, cd, ch = flat, d, hi
         else:
             sel = (ri >= r0) & (ri < r1)
             if not sel.any(): continue
-            cr, ce = ri[sel], ei[sel]
-        xs = ex0[ce] + (ys[cr] - ey0[ce]) * slope[ce]
-        xs = np.clip(xs - x0, 0.0, float(w))
-        ix = np.floor(xs).astype(np.intp)
-        frac = xs - ix
-        d = dirs[ce]
-        # bincount accumulates in input order exactly like np.add.at, at a fraction of the cost
-        flat = (cr - r0) * (w + 2) + ix
-        acc = np.bincount(np.concatenate([flat, flat + 1]), np.concatenate([d * (1.0 - frac), d * frac]),
+            cf, cd, ch = flat[sel] - r0 * (w + 2), d[sel], hi[sel]
+        acc = np.bincount(np.concatenate([cf, cf + 1]), np.concatenate([cd - ch, ch]),
                           (r1 - r0) * (w + 2)).reshape(r1 - r0, w + 2)
         wind = np.cumsum(acc, axis = 1, out = acc)[:, :w]
-        if even_odd:
-            m = np.abs(wind) % 2.0
-            band = np.minimum(m, 2.0 - m)
+        if simple:
+            band = np.abs(wind, out = wind)
+            band /= SS
+            part = np.minimum(band, 1.0, out = band)
         else:
-            band = np.minimum(np.abs(wind, out = wind), 1.0, out = wind)
-        if cov is None:
+            if even_odd:
+                m = np.abs(wind) % 2.0
+                band = np.minimum(m, 2.0 - m)
+            else:
+                band = np.minimum(np.abs(wind, out = wind), 1.0, out = wind)
             # Each row is the mean of SS bands in [0, 1], so it is in [0, 1] itself and needs no clipping
-            cov = band.reshape(-1, SS, w).sum(axis = 1)
-            cov /= SS
-            return cov
-        cov[r0 // SS:r1 // SS] += band.reshape(-1, SS, w).sum(axis = 1) / SS
-    return np.clip(cov, 0.0, 1.0)
+            part = band.reshape(-1, SS, w).sum(axis = 1)
+            part /= SS
+        if cov is None: return part
+        cov[r0 // (1 if simple else SS):r1 // (1 if simple else SS)] = part
+    return cov
 
 
 def _arc(cx, cy, r):
@@ -206,6 +286,7 @@ def stroke_polys(subs, width, cap, join, dash = None, phase = 0.0):
             run = [p for i, p in enumerate(run) if i == 0 or p != run[i - 1]]
             if len(run) < 2: continue
             closed = run[0] == run[-1] and len(run) > 2
+            first = len(polys)
             for i in range(len(run) - 1):
                 (ax, ay), (bx, by) = run[i], run[i + 1]
                 dx, dy = bx - ax, by - ay
@@ -227,15 +308,15 @@ def stroke_polys(subs, width, cap, join, dash = None, phase = 0.0):
                     turn = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
                     s = math.pi / 2 if turn > 0 else -math.pi / 2
                     n = max(2, int(math.ceil(abs(turn) / (2 * math.pi) * max(16, int(7 * math.sqrt(hw))))) + 1)
-                    # np.linspace(a1 - s, a1 - s + turn, n + 1) element for element, without its overhead; linspace
-                    # only differs for a step that underflows to zero, which a turn (0, or at least an ulp of pi) over n
-                    # never is
+                    # A few facets, so math beats numpy's per-call overhead
                     start, stop = a1 - s, a1 - s + turn
-                    t = np.arange(n + 1, dtype = np.float64) * ((stop - start) / n)
-                    t += start
-                    t[-1] = stop
-                    fan = [(cx, cy)] + list(zip((cx + hw * np.cos(t)).tolist(), (cy + hw * np.sin(t)).tolist()))
-                    polys.append(fan if turn > 0 else fan[::-1])
+                    step = (stop - start) / n
+                    arc = [(cx + hw * math.cos(start + k * step), cy + hw * math.sin(start + k * step))
+                           for k in range(n)]
+                    arc.append((cx + hw * math.cos(stop), cy + hw * math.sin(stop)))
+                    # The sector sits against the start of the quad leaving this joint, its last radius on that quad's
+                    # end, so it joins the quad as one polygon: a third fewer edges to cross
+                    polys[first + i].extend([(cx, cy)] + arc[:-1] if turn > 0 else arc[-2::-1] + [(cx, cy)])
                     continue
                 u1 = ((cx - px), (cy - py))
                 u2 = ((nx2 - cx), (ny2 - cy))
@@ -313,8 +394,8 @@ class Image:
         """Premultiplied float RGBA accumulation buffer, one plane per channel, so that every blend runs along rows
         instead of across four channels."""
         self.w, self.h = w, h
-        self.buf = np.zeros((4, h, w), dtype = np.float64)
-    def paint(self, edges, rgb, alpha, even_odd = False, box = None):
+        self.buf = np.zeros((4, h, w), dtype = np.float32)
+    def paint(self, edges, rgb, alpha, even_odd = False, box = None, simple = False):
         if not len(edges) or alpha <= 0: return
         lo = box[:2] if box else (-1e9, -1e9)
         hi = box[2:] if box else (1e9, 1e9)
@@ -324,12 +405,12 @@ class Image:
         y0 = max(0, int(math.floor(max(ye.min(), lo[1]))))
         y1 = min(self.h, int(math.ceil(min(ye.max(), hi[1]))) + 1)
         if x1 <= x0 or y1 <= y0: return
-        a = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd)
+        a = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd, simple).astype(np.float32)
         if alpha != 1:
             a *= alpha
         covered = np.count_nonzero(a)
         if not covered: return
-        col = np.append(np.asarray(rgb, dtype = np.float64), 1.0)
+        col = np.append(np.asarray(rgb, dtype = np.float32), np.float32(1.0))
         # A mostly covered box (a figure or axes background, a square symbol) blends fastest as one slice
         if 2 * covered > a.size:
             sub = self.buf[:, y0:y1, x0:x1]
@@ -342,7 +423,7 @@ class Image:
         ys += y0
         xs += x0
         self.buf[:, ys, xs] = self.buf[:, ys, xs] * (1 - v) + col[:, None] * v
-    def paint_grad(self, edges, grad, ctm, alpha, even_odd = False, box = None):
+    def paint_grad(self, edges, grad, ctm, alpha, even_odd = False, box = None, simple = False):
         """Fill `edges` with a radial gradient evaluated per pixel in the op's user space."""
         inv = _inv(ctm)
         if inv is None or not len(edges) or alpha <= 0: return
@@ -353,7 +434,7 @@ class Image:
         y0 = max(0, int(math.floor(max(edges[:, [1, 3]].min(), lo[1]))))
         y1 = min(self.h, int(math.ceil(min(edges[:, [1, 3]].max(), hi[1]))) + 1)
         if x1 <= x0 or y1 <= y0: return
-        cov = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd)
+        cov = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd, simple)
         if not cov.any(): return
         kind, geo, stops = grad
         px, py = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
@@ -424,18 +505,73 @@ def encode_png(arr, texts = (), dpi = None):
     return b''.join(out)
 
 
-def _box_blur(a, radius):
-    """Three box passes approximate a Gaussian closely enough for a shadow."""
+def _box_blur(a, radius, f = 1):
+    """Three box passes approximate a Gaussian closely enough for a shadow; on a grid `f` times coarser, three odd
+    widths that come closest to the variance of the full-resolution passes stand in for them."""
     if radius < 1: return a
     k = 2 * int(radius) + 1
-    for _ in range(3):
+    var = (k * k - 1) / 4.0 / (f * f)
+    lo = max(1, (int(math.sqrt(4 * var + 1)) - 1) // 2 * 2 + 1)
+    ks = min(([lo] * (3 - n) + [lo + 2] * n for n in range(4)),
+             key = lambda q: abs(sum(v * v - 1 for v in q) / 12 - var))
+    # Only the ink's box, widened by as far as the passes spread it, can come out nonzero
+    ys, xs = np.flatnonzero(a.any(axis = 1)), np.flatnonzero(a.any(axis = 0))
+    out = np.zeros_like(a)
+    if not len(ys): return out
+    m = sum(v // 2 for v in ks)
+    y0, y1, x0, x1 = max(0, ys[0] - m), ys[-1] + m + 1, max(0, xs[0] - m), xs[-1] + m + 1
+    # In float32, each pass divided by its width so that the running sums stay small enough to keep their precision
+    b = a[y0:y1, x0:x1].astype(np.float32)
+    for k in ks:
         for axis in (0, 1):
-            # One extra zero in front makes every window a plain difference of the running sum, with no stacking;
-            # the passes are linear, so the six divisions by k collapse into one at the end
-            pad = np.pad(a, ((k // 2 + 1, k // 2), (0, 0)) if axis == 0 else ((0, 0), (k // 2 + 1, k // 2)))
-            c = np.cumsum(pad, axis = axis)
-            a = (c[k:] - c[:-k]) if axis == 0 else (c[:, k:] - c[:, :-k])
-    return a / k ** 6
+            # Along axis 0 of the transposed view for axis 1: a window is a difference of the running sum, and the
+            # windows that reach past either end simply stop there, as with zeros beyond
+            b = b.T if axis else b
+            n, r, c = len(b), k // 2, np.cumsum(b, axis = 0)
+            b = np.empty_like(c)
+            b[r + 1:n - r] = c[k:] - c[:n - k]
+            b[:r + 1] = c[r:k]
+            b[n - r:] = c[-1] - c[n - k:n - r - 1]
+            b *= 1.0 / k
+            b = b.T if axis else b
+    out[y0:y1, x0:x1] = b
+    return out
+
+
+def _resample(a, f, w, h, dx, dy):
+    """`a`, on a grid `f` times coarser, back on the (h, w) pixel grid and moved by (dx, dy) pixels, interpolated
+    linearly, with zeros beyond its edges."""
+    out = a
+    for axis, n, d in ((1, w, dx), (0, h, dy)):
+        # Pixel j = f * q + r samples the coarse grid at q + (r + 0.5 - d) / f - 0.5, so each phase r is two slices
+        pad = int(abs(d) / f) + 2
+        src = np.pad(out, ((0, 0), (pad, pad)) if axis else ((pad, pad), (0, 0)))
+        out = np.empty((src.shape[0], n) if axis else (n, src.shape[1]), dtype = src.dtype)
+        for r in range(f):
+            u = (r + 0.5 - d) / f - 0.5 + pad
+            i, cnt = int(math.floor(u)), len(range(r, n, f))
+            t = u - i
+            if axis:
+                out[:, r::f] = src[:, i:i + cnt] * (1 - t) + src[:, i + 1:i + 1 + cnt] * t
+            else:
+                out[r::f] = src[i:i + cnt] * (1 - t) + src[i + 1:i + 1 + cnt] * t
+    return out
+
+
+def _shadow(ops, w, h, flip, sc, shadow, sticker, cut = None):
+    """The shadow's coverage on the (h, w) grid: the symbols' or, under a die cut, the cut silhouette's, blurred and
+    moved into place. A blur this wide leaves nothing that half the resolution could not carry, so from 10 pixels up
+    it is drawn and blurred on a quarter of the pixels; `cut` is a full-resolution silhouette that is already drawn."""
+    radius = max(1, int(round(shadow['blur'] * sc)))
+    f = 2 if radius >= 10 else 1
+    if cut is not None:
+        base = cut if f == 1 else np.pad(cut, ((0, -h % f), (0, -w % f))).reshape(-(-h // f), f, -(-w // f), f).mean(
+            axis = (1, 3))
+    else:
+        grow = ((sticker['width'] + sticker['edge']) * sc / f) if sticker else 0.0
+        base = _ink_mask(ops, -(-w // f), -(-h // f), _mul(flip, (1.0 / f, 0.0, 0.0, 1.0 / f, 0.0, 0.0)), 0.0, 0.0,
+                         grow, not sticker)
+    return _resample(_box_blur(base, radius, f), f, w, h, shadow['dx'] * sc, shadow['dy'] * sc)
 
 
 def _ink_mask(ops, w, h, flip, dx = 0.0, dy = 0.0, grow = 0.0, symbols_only = True):
@@ -446,7 +582,7 @@ def _ink_mask(ops, w, h, flip, dx = 0.0, dy = 0.0, grow = 0.0, symbols_only = Tr
     """
     mask = np.zeros((h, w), dtype = np.float64)
     shift = _mul(flip, (1.0, 0.0, 0.0, 1.0, dx, dy))
-    def add(edges, even_odd = False):
+    def add(edges, even_odd = False, simple = False):
         if not len(edges): return
         x0 = max(0, int(math.floor(edges[:, [0, 2]].min())))
         x1 = min(w, int(math.ceil(edges[:, [0, 2]].max())) + 1)
@@ -454,7 +590,7 @@ def _ink_mask(ops, w, h, flip, dx = 0.0, dy = 0.0, grow = 0.0, symbols_only = Tr
         y1 = min(h, int(math.ceil(edges[:, [1, 3]].max())) + 1)
         if x1 <= x0 or y1 <= y0: return
         sub = mask[y0:y1, x0:x1]
-        np.maximum(sub, coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd), out = sub)
+        np.maximum(sub, coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd, simple), out = sub)
     for op in ops:
         ctm = _mul(op['ctm'], shift)
         if _inv(ctm) is None: continue
@@ -463,10 +599,16 @@ def _ink_mask(ops, w, h, flip, dx = 0.0, dy = 0.0, grow = 0.0, symbols_only = Tr
             if not (op['fill'] and op['stroke'] if symbols_only else op['fill'] or op['stroke']): continue
             subs = flatten(op['path'], ctm)
             if not subs: continue
-            if op['fill']: add(_edges(subs, True), op.get('even_odd', False))
             width = (op['line_width'] * sc if op['stroke'] else 0.0) + 2.0 * grow
-            if width > 0:
-                add(_edges(stroke_polys(subs, width, 1 if grow else op['cap'], 1 if grow else op['join']), True))
+            cap, join = (1, 1) if grow else (op['cap'], op['join'])
+            # A filled convex symbol and its stroke make up its outer offset alone, a linkage its capsule
+            edges = _outline(subs, max(width, 0.1) / 2.0, cap, join, op['fill']) if width > 0 else None
+            if edges is not None:
+                add(edges, simple = True)
+                continue
+            if op['fill']:
+                add(_edges(subs, True), op.get('even_odd', False), len(subs) == 1 and _convex(subs[0]) is not None)
+            if width > 0: add(_edges(stroke_polys(subs, width, cap, join), True))
         elif not symbols_only:
             subs = []
             for cmds, gctm in _glyph_paths(op, ctm):
@@ -478,15 +620,16 @@ def _ink_mask(ops, w, h, flip, dx = 0.0, dy = 0.0, grow = 0.0, symbols_only = Tr
 
 
 def shadow_alpha(ops, width, height, shadow, sticker = None, dpi = 150.0):
-    """Blurred shadow coverage as a uint8 mask, for use as a PDF luminosity soft mask."""
+    """Blurred shadow coverage as 8-bit rows for a PDF soft mask, each a PNG Sub filter byte and the differences to
+    its left neighbors: a blur changes little from pixel to pixel, so they pack 30% tighter than the plain values."""
     sc = dpi / 72.0
     w, h = max(1, int(round(width * sc))), max(1, int(round(height * sc)))
     flip = (sc, 0.0, 0.0, -sc, 0.0, float(h))
-    grow = ((sticker['width'] + sticker['edge']) * sc) if sticker else 0.0
-    mask = _box_blur(_ink_mask(ops, w, h, flip, shadow['dx'] * sc, shadow['dy'] * sc, grow, not sticker),
-                     max(1, int(round(shadow['blur'] * sc))))
-    a = np.clip(mask * shadow['alpha'], 0.0, 1.0)
-    return w, h, np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    a = np.clip(_shadow(ops, w, h, flip, sc, shadow, sticker) * shadow['alpha'], 0.0, 1.0)
+    rows = np.ones((h, w + 1), dtype = np.uint8)
+    rows[:, 1:] = np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    rows[:, 2:] -= rows[:, 1:-1].copy()
+    return w, h, rows.tobytes()
 
 
 def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, shadow = None, sticker = None):
@@ -496,19 +639,22 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
     flip = (scale_x, 0.0, 0.0, -scale_y, 0.0, float(h))
     img = Image(w, h)
     sc = (scale_x + scale_y) / 2.0
-    if shadow:
-        grow = ((sticker['width'] + sticker['edge']) * sc) if sticker else 0.0
-        mask = _box_blur(_ink_mask(ops, w, h, flip, shadow['dx'] * sc, shadow['dy'] * sc, grow, not sticker),
-                         max(1, int(round(shadow['blur'] * sc))))
-        a = np.clip(mask * shadow['alpha'], 0.0, 1.0)
-        img.buf[:3] = np.asarray(shadow['color'], dtype = np.float64)[:, None, None] * a
-        img.buf[3] = a
     if sticker:
         layers = [(sticker['width'] + sticker['edge'], sticker['edge_color'])] if sticker['edge'] > 0 else []
-        for grow, color in layers + [(sticker['width'], sticker['color'])]:
-            a = np.clip(_ink_mask(ops, w, h, flip, 0.0, 0.0, grow * sc, False), 0.0, 1.0)
-            img.buf[:3] = img.buf[:3] * (1 - a) + np.asarray(color, dtype = np.float64)[:, None, None] * a
-            img.buf[3] = img.buf[3] * (1 - a) + a
+        layers = [(np.clip(_ink_mask(ops, w, h, flip, 0.0, 0.0, grow * sc, False), 0.0, 1.0), color)
+                  for grow, color in layers + [(sticker['width'], sticker['color'])]]
+    if shadow:
+        # A die cut casts the shadow of its outermost silhouette, which is reused rather than drawn again
+        a = np.clip(_shadow(ops, w, h, flip, sc, shadow, sticker, layers[0][0] if sticker else None) * shadow['alpha'],
+                    0.0, 1.0)
+        img.buf[:3] = np.asarray(shadow['color'], dtype = np.float64)[:, None, None] * a
+        img.buf[3] = a
+    for a, color in layers if sticker else ():
+        # In place, plane by plane: the whole page, so temporaries cost more than the arithmetic
+        rest = 1 - a
+        for c, v in enumerate(tuple(color) + (1.0,)):
+            img.buf[c] *= rest
+            img.buf[c] += a * v
     for op in ops:
         ctm = _mul(op['ctm'], flip)
         if _inv(ctm) is None: continue
@@ -516,17 +662,22 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
         if op['kind'] == 'path':
             subs = flatten(op['path'], ctm)
             if not subs: continue
+            # A single convex outline (a circle, square, diamond or triangle symbol) fills with a winding of 0 or 1
+            simple = len(subs) == 1 and _convex(subs[0]) is not None
             if op['fill'] and op.get('fill_grad'):
                 img.paint_grad(_edges(subs, True), op['fill_grad'], ctm, op['fill_alpha'], op.get('even_odd', False),
-                               box)
+                               box, simple)
             elif op['fill']:
-                img.paint(_edges(subs, True), op['fill_rgb'], op['fill_alpha'], op.get('even_odd', False), box)
+                img.paint(_edges(subs, True), op['fill_rgb'], op['fill_alpha'], op.get('even_odd', False), box, simple)
             if op['stroke']:
                 sc = math.sqrt(abs(ctm[0] * ctm[3] - ctm[1] * ctm[2])) or 1.0
                 dash = [v * sc for v in op['dash'][0]] if op['dash'] and op['dash'][0] else None
-                polys = stroke_polys(subs, op['line_width'] * sc, op['cap'], op['join'], dash,
-                                     (op['dash'][1] if op['dash'] else 0.0) * sc)
-                img.paint(_edges(polys, True), op['stroke_rgb'], op['stroke_alpha'], False, box)
+                edges = None if dash else _outline(subs, max(op['line_width'] * sc, 0.1) / 2.0, op['cap'], op['join'])
+                fast = edges is not None
+                if not fast:
+                    edges = _edges(stroke_polys(subs, op['line_width'] * sc, op['cap'], op['join'], dash,
+                                                (op['dash'][1] if op['dash'] else 0.0) * sc), True)
+                img.paint(edges, op['stroke_rgb'], op['stroke_alpha'], False, box, fast)
         elif op['kind'] == 'image':
             # Nearest-neighbor lookup of each device pixel center in the unit square the image is drawn onto
             inv, corners = _inv(ctm), [_apply(ctm, u, v) for u in (0, 1) for v in (0, 1)]

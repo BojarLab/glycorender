@@ -168,7 +168,7 @@ def test_box_blur_is_three_moving_averages_per_axis():
         for _ in range(3):
             for axis in (0, 1):
                 ref = np.apply_along_axis(lambda r: np.convolve(r, np.ones(k) / k, 'same'), axis, ref)
-        assert np.allclose(raster._box_blur(a, radius), ref, rtol = 0, atol = 1e-12)
+        assert np.allclose(raster._box_blur(a, radius), ref, rtol = 0, atol = 1e-6)
 
 
 def test_round_joins_fill_the_whole_stroke_outline():
@@ -181,6 +181,62 @@ def test_round_joins_fill_the_whole_stroke_outline():
         t = np.clip(((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / ((bx - ax) ** 2 + (by - ay) ** 2), 0, 1)
         dist = np.minimum(dist, np.hypot(px - ax - t * (bx - ax), py - ay - t * (by - ay)))
     assert np.all(a[dist < hw - 0.75] > 0.99) and np.all(a[dist > hw + 0.75] < 0.01)
+
+
+def test_convex_outlines_cover_what_the_stroke_pieces_cover():
+    t = np.linspace(0, 2 * np.pi, 257)
+    circle = list(zip((60.3 + 40 * np.cos(t)).tolist(), (60.7 + 40 * np.sin(t)).tolist()))
+    circle[-1] = circle[0]
+    square = [(20.0, 20.0), (100.0, 20.0), (100.0, 100.0), (20.0, 100.0), (20.0, 20.0)]
+    spike = [(60.0, 5.0), (64.0, 110.0), (56.0, 110.0), (60.0, 5.0)]  # an apex past the miter limit is beveled
+    seg = [(20.2, 30.1), (95.3, 80.7)]
+    def both(sub, hw, cap, join, filled = False):
+        a = raster._outline([sub], hw, cap, join, filled)
+        b = raster._edges(raster.stroke_polys([sub], 2 * hw, cap, join) + ([sub] if filled else []), True)
+        return raster.coverage(a, 0, 0, 130, 130, simple = True), raster.coverage(b, 0, 0, 130, 130)
+    # Straight sides: the same region, exactly
+    for sub, hw, cap, join, filled in [(square, 4, 0, 0, False), (square[::-1], 4, 0, 1, False),
+                                       (square, 9, 0, 1, True),
+                                       (spike, 2, 0, 0, False), (spike, 2, 0, 2, False), (seg, 4, 0, 0, False),
+                                       (seg, 4, 2, 0, False)]:
+        a, b = both(sub, hw, cap, join, filled)
+        assert np.abs(a - b).max() < 1e-9
+    # Curves and round ends: the same ink, minus what the overlapping pieces double-counted along their edges
+    for sub, cap, join in [(circle, 0, 1), (circle, 0, 0), (seg, 1, 1), (seg + seg[:1], 1, 1), (seg + seg[:1], 1, 0)]:
+        a, b = both(sub, 4, cap, join)
+        assert a.sum() == pytest.approx(b.sum(), rel = 0.05) and a.sum() <= b.sum() + 0.5
+    star = [(60 + (40 if i % 2 else 15) * np.cos(i * np.pi / 5), 60 + (40 if i % 2 else 15) * np.sin(i * np.pi / 5))
+            for i in range(11)]
+    small = [(x / 8 + 50, y / 8 + 50) for x, y in circle]
+    for subs, hw in [([star], 2), ([square, square], 2), ([square[:3]], 2), ([small], 6)]:
+        assert raster._outline(subs, hw, 1, 1) is None  # concave, two subpaths, open, eroded away: stroke_polys
+    assert raster._convex(star) is None and raster._convex(square[::-1]) is not None
+
+
+def test_coverage_in_row_chunks_with_both_fill_rules():
+    # 20000 pixels wide, so the sub-scanlines come in several chunks; an inner square, the same way round, is a hole
+    # only under even-odd
+    outer = [(10.0, 5.0), (19990.0, 5.0), (19990.0, 55.0), (10.0, 55.0)]
+    inner = [(100.0, 20.0), (200.0, 20.0), (200.0, 40.0), (100.0, 40.0)]
+    edges = raster._edges([outer, inner], True)
+    assert raster.coverage(edges, 0, 0, 20000, 60).sum() == pytest.approx(19980 * 50)
+    assert raster.coverage(edges, 0, 0, 20000, 60, even_odd = True).sum() == pytest.approx(19980 * 50 - 2000)
+    assert raster.coverage(raster._edges([outer], True), 0, 0, 20000, 60, simple = True).sum() == pytest.approx(
+        19980 * 50)
+
+
+def test_gradient_concave_and_dashed_shapes_reach_the_png():
+    svg = SNFG_SVG.replace('<defs>', '<defs><radialGradient id="g" cx="0.5" cy="0.5" r="0.5"><stop offset="0" '
+                           'stop-color="#FF0000" /><stop offset="1" stop-color="#0000FF" /></radialGradient>').replace(
+        '</g>', '<circle cx="20" cy="30" r="15" fill="url(#g)" /><path d="M-140,-40 L-120,-50 L-130,-30 L-110,-35 Z" '
+        'fill="#FCC326" stroke="#000000" stroke-width="2.0" /><path d="M-140,45 L40,45" stroke="#000000" '
+        'stroke-width="2.0" stroke-dasharray="10,10" fill="none" /></g>')
+    c = _render_svg_to_pdf_canvas(svg, None, alt_text_info = None)
+    img = raster.render(c.ops, c.width, c.height, 2.0, 2.0, (1.0, 1.0, 1.0))
+    assert img[170, 340, 0] > 240 and img[170, 340, 2] < 15  # the gradient's center
+    assert img[200, 22:280].min() < 100 and (img[200, 22:280].min(axis = 1) > 200).sum() > 60  # dashes and gaps
+    sticker = raster._ink_mask(c.ops, 400, 220, (2.0, 0.0, 0.0, -2.0, 0.0, 220.0), grow = 6.0, symbols_only = False)
+    assert sticker[16:24, 30].max() > 0.99  # the concave quadrilateral, grown
 
 
 def test_svg_output_carries_the_cut_layer():

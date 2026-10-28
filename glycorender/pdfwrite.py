@@ -456,16 +456,17 @@ class Canvas:
     def _shadow_object(self, out, spec, sticker):
         """Flat shadow color behind a grayscale soft mask; a blurred shadow cannot stay vector."""
         from . import raster
-        w, h, mask = raster.shadow_alpha(self.ops, self.width, self.height, spec, sticker)
-        packed = zlib.compress(mask.tobytes(), 9)
+        w, h, rows = raster.shadow_alpha(self.ops, self.width, self.height, spec, sticker)
+        packed = zlib.compress(rows, 9)
         smask = out.add(('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray '
-                         '/BitsPerComponent 8 /Filter /FlateDecode /Length %d >>\nstream\n'
-                         % (w, h, len(packed))).encode() + packed + b'\nendstream')
-        rgb = bytes(bytearray(int(round(v * 255)) for v in spec['color']) * (w * h))
-        body = zlib.compress(rgb, 9)
-        return out.add(('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB '
-                        '/BitsPerComponent 8 /Filter /FlateDecode /SMask %d 0 R /Length %d >>\nstream\n'
-                        % (w, h, smask, len(body))).encode() + body + b'\nendstream')
+                         '/BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns %d >> '
+                         '/Length %d >>\nstream\n' % (w, h, w, len(packed))).encode() + packed + b'\nendstream')
+        # The color is one flat value, so the image under the mask is a one-entry palette at a bit per pixel
+        body = zlib.compress(bytes((w + 7) // 8 * h), 9)
+        color = ''.join('%02X' % int(round(v * 255)) for v in spec['color'])
+        return out.add(('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace [/Indexed /DeviceRGB 0 '
+                        '<%s>] /BitsPerComponent 1 /Filter /FlateDecode /SMask %d 0 R /Length %d >>\nstream\n'
+                        % (w, h, color, smask, len(body))).encode() + body + b'\nendstream')
     def _shading_objects(self, out, grad, bbox, alpha):
         """Radial shading plus the luminosity soft mask that carries its per-stop alpha."""
         kind, geo, stops = grad
