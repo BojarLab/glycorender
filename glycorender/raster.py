@@ -100,8 +100,9 @@ def _convex(sub):
         turn = np.arctan2(e[:, 0] * nxt[:, 1] - e[:, 1] * nxt[:, 0], (e * nxt).sum(axis = 1))
         if turn.sum() > 0: break
         p = p[::-1]
-    # No turn the other way beyond rounding, and one revolution in all
-    return p if turn.min() >= -1e-9 and abs(turn.sum() - 2 * math.pi) <= 1e-6 else None
+    # No turn the other way beyond rounding, no reversal (a straight subpath out and back turns by pi twice and has no
+    # inside; within 1e-6 of pi, as on a diagonal one, the cosine of the turn rounds to -1), and one revolution in all
+    return p if turn.min() >= -1e-9 and turn.max() < math.pi - 1e-6 and abs(turn.sum() - 2 * math.pi) <= 1e-6 else None
 
 
 def _outline(subs, hw, cap, join, filled = False):
@@ -150,7 +151,7 @@ def _outline(subs, hw, cap, join, filled = False):
     if filled: return _loops(outer)
     inner = p - (prev + nrm) * (hw / (1.0 + cos))[:, None]
     # The inner offset is the polygon eroded, valid only while none of its edges vanishes or turns around
-    if ((np.roll(inner, -1, axis = 0) - inner) * e).sum(axis = 1).min() <= 0: return None
+    if not (((np.roll(inner, -1, axis = 0) - inner) * e).sum(axis = 1) > 0).all(): return None
     return _loops(outer, inner[::-1])
 
 

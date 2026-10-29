@@ -208,9 +208,17 @@ def test_convex_outlines_cover_what_the_stroke_pieces_cover():
     star = [(60 + (40 if i % 2 else 15) * np.cos(i * np.pi / 5), 60 + (40 if i % 2 else 15) * np.sin(i * np.pi / 5))
             for i in range(11)]
     small = [(x / 8 + 50, y / 8 + 50) for x, y in circle]
-    for subs, hw in [([star], 2), ([square, square], 2), ([square[:3]], 2), ([small], 6)]:
-        assert raster._outline(subs, hw, 1, 1) is None  # concave, two subpaths, open, eroded away: stroke_polys
-    assert raster._convex(star) is None and raster._convex(square[::-1]) is not None
+    back = [(60.0, 10.0), (60.0, 40.0), (60.0, 90.0), (60.0, 10.0)]
+    # Out and back on a diagonal, collinear only up to rounding, so that it turns by 4e-16 less than pi
+    diag = [(13.025 + (97.3 - 13.025) * s, 21.7 + (113.9 - 21.7) * s) for s in np.linspace(0, 1, 33).tolist()]
+    diag.append(diag[0])
+    with np.errstate(divide = 'raise', invalid = 'raise'):
+        for subs, hw in [([star], 2), ([square, square], 2), ([square[:3]], 2), ([small], 6), ([back], 1), ([diag], 1)]:
+            # concave, two subpaths, open, eroded away, out and back along one line: stroke_polys
+            assert raster._outline(subs, hw, 1, 1) is None
+    assert raster._convex(star) is None and raster._convex(back) is None and raster._convex(square[::-1]) is not None
+    a = raster.coverage(raster._edges(raster.stroke_polys([back], 2, 0, 1), True), 0, 0, 130, 130)
+    assert np.isfinite(a).all() and a[20:80, 59:61].min() > 0.4
 
 
 def test_coverage_in_row_chunks_with_both_fill_rules():
