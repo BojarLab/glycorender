@@ -63,6 +63,30 @@ def _element(d, op, fill, stroke, undo, grads = None, prefix = ''):
     return '<path ' + ' '.join(attrs) + ' />'
 
 
+def _image(op, undo):
+    """An image op on the unit square of its user space, whose first row is at the top: SVG's y runs down, so flip it."""
+    import base64
+    import numpy as np
+    from .raster import encode_png
+    px = np.frombuffer(op['rgb'], np.uint8).reshape(op['h'], op['w'], 3)
+    if op.get('alpha') is not None:
+        px = np.dstack([px, np.frombuffer(op['alpha'], np.uint8).reshape(op['h'], op['w'], 1)])
+    data = base64.b64encode(encode_png(px)).decode()
+    opacity = ' opacity="%s"' % _fmt(op['fill_alpha']) if op['fill_alpha'] < 1 else ''
+    return ('<image width="1" height="1" preserveAspectRatio="none"%s transform="matrix(%s) matrix(1 0 0 -1 0 1)" '
+            'href="data:image/png;base64,%s" />' % (opacity, ' '.join(_fmt(v) for v in _mul(op['ctm'], undo)), data))
+
+
+def _clipped(el, op, clips, prefix):
+    """An element inside a group per clip rectangle of its op; a group has no transform of its own, unlike a shape."""
+    for clip in op.get('clip') or ():
+        key = (tuple(clip[0]), tuple(clip[1]))
+        if key not in clips:
+            clips[key] = '%sclip%d' % (prefix, len(clips))
+        el = '<g clip-path="url(#%s)">%s</g>' % (clips[key], el)
+    return el
+
+
 def _filter(shadow, name):
     return ('<filter id="%s" x="-30%%" y="-30%%" width="160%%" height="160%%">'
             '<feDropShadow dx="%s" dy="%s" stdDeviation="%s" flood-color="%s" flood-opacity="%s" />'
@@ -77,6 +101,8 @@ def emit(ops, width, height, shadow = None, sticker = None):
         if op['kind'] == 'path':
             if not (op['fill'] or op['stroke']): continue
             shapes.append((op, _d(op['path'])))
+        elif op['kind'] == 'image':
+            shapes.append((op, ''))
         else:
             ttf, pen, segs = op['ttf'], op['x'], []
             gids = [ttf.gid(ch) for ch in op['text']]
@@ -105,6 +131,7 @@ def emit(ops, width, height, shadow = None, sticker = None):
             body.append('<g fill="%s" stroke="%s" stroke-linecap="round" stroke-linejoin="round">'
                         % (_hex(color), _hex(color)))
             for op, d in shapes:
+                if op['kind'] == 'image': continue
                 is_path = op['kind'] == 'path'
                 filled = not is_path or op['fill']
                 line = (op['line_width'] if is_path and op['stroke'] else 0.0) + 2 * grow
@@ -114,15 +141,22 @@ def emit(ops, width, height, shadow = None, sticker = None):
                     (' fill-rule="evenodd"' if op.get('even_odd') else '') if filled else ' fill="none"', _fmt(line)))
             body.append('</g>')
         if shadow: body.append('</g>')
+    clips = {}
     for op, d in shapes:
         if op['kind'] == 'path':
             el = _element(d, op, op['fill'], op['stroke'], undo, grads = grads, prefix = prefix)
             if shadow and not sticker and op['fill'] and op['stroke']:
                 el = el.replace('<path ', '<path filter="url(#%sshadow)" ' % prefix, 1)
-            body.append(el)
+        elif op['kind'] == 'image':
+            el = _image(op, undo)
         else:
-            body.append(_element(d, op, True, False, undo))
+            el = _element(d, op, True, False, undo)
+        body.append(_clipped(el, op, clips, prefix))
     defs, entries = '', []
+    for (box, ctm), name in clips.items():
+        entries.append('<clipPath id="%s"><rect x="%s" y="%s" width="%s" height="%s" transform="matrix(%s)" /></clipPath>'
+                       % ((name,) + tuple(_fmt(v) for v in box) + (' '.join(_fmt(v) for v in _mul(ctm, undo)),)))
+    defs = ''.join(entries)
     if grads:
         for (kind, geo, stops), name in grads.items():
             inner = ''.join('<stop offset="%s" stop-color="%s" stop-opacity="%s" />'
