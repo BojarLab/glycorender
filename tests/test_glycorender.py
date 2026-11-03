@@ -267,6 +267,33 @@ def test_svg_output_writes_shared_transform_and_cut_paint_once():
     assert edged.count('<g fill=') == 2 and edged.count('<g filter=') == 1  # keyline and cut share one shadow
 
 
+def test_svg_image_is_pixelated_and_has_no_vote_on_the_shared_transform():
+    c = pdfwrite.Canvas(BytesIO(), pagesize = (100, 100))
+    op = dict(c.state)
+    op.update(kind = 'image', w = 1, h = 1, rgb = bytes(3), alpha = None, ctm = (50.0, 0.0, 0.0, 50.0, 0.0, 0.0))
+    c.ops.append(op)
+    assert 'image-rendering:pixelated' in c.to_svg() and '<g transform="matrix(1 0 0 -1 0 100)">' in c.to_svg()
+    p = c.beginPath()
+    p.moveTo(1.0, 1.0)
+    p.lineTo(9.0, 1.0)
+    p.lineTo(9.0, 9.0)
+    p.close()
+    c.drawPath(p, fill = 1, stroke = 0)
+    svg = c.to_svg()
+    assert '<g transform="matrix(1 0 0 -1 0 100)">' in svg and '<path d="M1 1L9 1L9 9Z" fill=' in svg
+
+
+def test_svg_clip_rect_keeps_its_own_transform(tmp_path):
+    simple_svg_to_png('<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><defs><clipPath id="k">'
+                      '<rect width="5" height="20" transform="matrix(1 0 0 1 10 0)"/></clipPath></defs>'
+                      '<rect width="20" height="20" fill="#FF0000" clip-path="url(#k)"/></svg>', tmp_path / "clip.png")
+    c = pdfwrite.Canvas(None, pagesize = (1, 1))
+    c.drawImage((tmp_path / "clip.png").read_bytes())
+    h, w = c.ops[0]['h'], c.ops[0]['w']
+    alpha = np.frombuffer(c.ops[0]['alpha'], np.uint8).reshape(h, w)
+    assert alpha[h // 2, w * 12 // 20] == 255 and alpha[h // 2, w * 2 // 20] == 0
+
+
 def test_pdf_to_svg_bytes_passes_effects_through():
     assert 'feDropShadow' in pdf_to_svg_bytes(SNFG_SVG, sticker = True)
     assert 'feDropShadow' not in pdf_to_svg_bytes(SNFG_SVG)

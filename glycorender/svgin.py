@@ -345,6 +345,7 @@ class _Renderer:
         for child in node:
             if _tag(child) == 'rect':
                 box = (_num(child.get('x')), _num(child.get('y')), _num(child.get('width')), _num(child.get('height')))
+                inner = _mul(_transform(child.get('transform')), inner)
             elif _tag(child) == 'path':
                 pts = [(s[-2], s[-1]) for s in parse_path(child.get('d')) if s[0] != 'h']
                 if pts:

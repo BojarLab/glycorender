@@ -64,7 +64,7 @@ def _element(d, op, fill, stroke, undo, grads = None, prefix = ''):
 
 
 def _image(op, undo):
-    """An image op on the unit square of its user space, whose first row is at the top: SVG's y runs down, so flip it."""
+    """An image op on the unit square of its user space, first row at the top: SVG's y runs down, so flip it."""
     import base64
     import numpy as np
     from .raster import encode_png
@@ -73,8 +73,10 @@ def _image(op, undo):
         px = np.dstack([px, np.frombuffer(op['alpha'], np.uint8).reshape(op['h'], op['w'], 1)])
     data = base64.b64encode(encode_png(px)).decode()
     opacity = ' opacity="%s"' % _fmt(op['fill_alpha']) if op['fill_alpha'] < 1 else ''
+    # Pixelated like the rasterizer's nearest neighbor, so that a heatmap's cells stay cells in a browser
     return ('<image width="1" height="1" preserveAspectRatio="none"%s transform="matrix(%s) matrix(1 0 0 -1 0 1)" '
-            'href="data:image/png;base64,%s" />' % (opacity, ' '.join(_fmt(v) for v in _mul(op['ctm'], undo)), data))
+            'style="image-rendering:pixelated" href="data:image/png;base64,%s" />'
+            % (opacity, ' '.join(_fmt(v) for v in _mul(op['ctm'], undo)), data))
 
 
 def _clipped(el, op, clips, prefix):
@@ -119,8 +121,10 @@ def emit(ops, width, height, shadow = None, sticker = None):
                 if n + 1 < len(gids):
                     pen += ttf.kern(gid, gids[n + 1]) * k
             if segs: shapes.append((op, ''.join(segs)))
-    # Shapes mostly share one transform: the drawing's group applies it, so that they need none of their own
-    common = Counter(op['ctm'] for op, _ in shapes).most_common(1)[0][0] if shapes else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    # Shapes mostly share one transform: the drawing's group applies it, so that they need none of their own. An image's
+    # scale has no vote, as the shapes' transforms would have to undo it in four decimals.
+    counts = Counter(op['ctm'] for op, _ in shapes if op['kind'] != 'image')
+    common = counts.most_common(1)[0][0] if counts else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
     undo = _inv(common)
     if sticker:
         layers = [(sticker['width'] + sticker['edge'], sticker['edge_color'])] if sticker['edge'] > 0 else []
