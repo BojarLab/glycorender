@@ -1,5 +1,6 @@
 """Tests for glycorender: the SVG subset GlycoDraw emits, and the PNG/PDF/SVG backends."""
 import base64, os, re, struct, zlib
+from io import BytesIO
 from types import SimpleNamespace
 import numpy as np
 import pytest
@@ -425,3 +426,166 @@ def test_svgdraw_defs_duplicates_and_text_forms():
 </g>
 </svg>"""
     assert d.all_elements() == d.elements and len(_render_svg_to_pdf_canvas(d.as_svg(), None).ops) > 0
+
+
+def _image_op(w, h, ctm, alpha = None, fill_alpha = 1.0):
+    # A page's display list holding one image, with a color per pixel from its position
+    rgb = np.dstack([np.arange(w * h).reshape(h, w) % 251, np.arange(w * h).reshape(h, w) % 241,
+                     np.arange(w * h).reshape(h, w) % 239]).astype(np.uint8)
+    c = pdfwrite.Canvas(BytesIO(), pagesize = (100, 100))
+    op = dict(c.state)
+    op.update(kind = 'image', w = w, h = h, rgb = rgb.tobytes(), alpha = None if alpha is None else alpha.tobytes(),
+              ctm = ctm, fill_alpha = fill_alpha)
+    return op, rgb
+
+
+def _rotated_route(op, scale):
+    # A rotation too small to move a pixel takes the general route, which the upright one has to agree with
+    tilted = dict(op)
+    a, b, c, d, e, f = op['ctm']
+    tilted['ctm'] = (a, 1e-11, 1e-11, d, e, f)
+    return raster.render([tilted], 100, 100, scale, scale, (1.0, 1.0, 1.0))
+
+
+@pytest.mark.parametrize('ctm, scale', [((50.0, 0.0, 0.0, 50.0, 10.0, 20.0), 1.0),  # on the output's grid
+                                        ((37.31, 0.0, 0.0, 61.73, 10.1, 20.4), 2.0),  # stretched
+                                        ((-40.0, 0.0, 0.0, 40.0, 60.0, 20.0), 1.0),  # mirrored
+                                        ((40.0, 0.0, 0.0, -40.0, 20.0, 70.0), 1.0),
+                                        ((300.0, 0.0, 0.0, 300.0, -100.0, -100.0), 1.0)])  # past the page
+@pytest.mark.parametrize('kind', ['opaque', 'dense', 'sparse', 'clear', 'half'])
+def test_upright_image_route_matches_general_route(ctm, scale, kind):
+    w, h = 50, 50
+    rng = np.random.default_rng(0)
+    alpha = {'opaque': None, 'half': None, 'dense': rng.integers(0, 256, (h, w)).astype(np.uint8),
+             'sparse': (rng.random((h, w)) < 0.05) * rng.integers(1, 256, (h, w)).astype(np.uint8),
+             'clear': np.zeros((h, w), np.uint8)}[kind]
+    op, _ = _image_op(w, h, ctm, alpha, 0.5 if kind == 'half' else 1.0)
+    fast = raster.render([op], 100, 100, scale, scale, (1.0, 1.0, 1.0))
+    assert np.abs(fast.astype(int) - _rotated_route(op, scale).astype(int)).max() <= 1
+
+
+def test_image_on_grid_copies_its_pixels():
+    op, rgb = _image_op(30, 20, (30.0, 0.0, 0.0, 20.0, 5.0, 7.0))
+    out = raster.render([op], 100, 100, 1.0, 1.0, (1.0, 1.0, 1.0))
+    assert (out[100 - 27:100 - 7, 5:35] == rgb).all() and (out[:100 - 27] == 255).all()
+
+
+def test_image_entirely_off_the_page_or_transparent():
+    op, _ = _image_op(10, 10, (10.0, 0.0, 0.0, 10.0, 200.0, 200.0))
+    assert (raster.render([op], 100, 100, 1.0, 1.0, (1.0, 1.0, 1.0)) == 255).all()
+    op, _ = _image_op(10, 10, (10.0, 0.0, 0.0, 10.0, 5.0, 5.0), fill_alpha = 0.0)
+    assert (raster.render([op], 100, 100, 1.0, 1.0, (1.0, 1.0, 1.0)) == 255).all()
+
+
+@pytest.mark.parametrize('coords', [(0.0, 10.0, 0.0, 90.0), (10.0, 0.0, 90.0, 0.0), (10.0, 10.0, 90.0, 90.0),
+                                    (50.0, 50.0, 50.0, 50.0)])
+def test_linear_gradient_along_an_axis(coords):
+    c = pdfwrite.Canvas(BytesIO(), pagesize = (100, 100))
+    c.setFillGradient('linear', coords, [(0.0, (1.0, 0.0, 0.0, 1.0)), (1.0, (0.0, 0.0, 1.0, 1.0))])
+    c.rect(10, 10, 80, 80, fill = 1, stroke = 0)
+    upright = c.ops[0]
+    tilted = dict(upright, ctm = (1.0, 1e-11, 1e-11, 1.0, 0.0, 0.0))
+    fast = raster.render([upright], 100, 100, 2.0, 2.0, (1.0, 1.0, 1.0))
+    assert np.abs(fast.astype(int) - raster.render([tilted], 100, 100, 2.0, 2.0, (1.0, 1.0, 1.0)).astype(int)).max() <= 1
+
+
+def test_large_path_coverage_matches_by_band():
+    # Enough rows to take several bands, computed in threads; each band's result must not depend on the others
+    t = np.linspace(0.0, 40.0, 400)
+    subs = [list(zip((t * 40.0).tolist(), (1000.0 + 900.0 * np.sin(t)).tolist()))]
+    edges = raster._edges(raster.stroke_polys(subs, 8.0, 1, 1), True)
+    whole = raster.coverage(edges, 0, 0, 1700, 2000)
+    assert whole.shape == (2000, 1700)
+    tops = [raster.coverage(edges, 0, y, 1700, 100) for y in (0, 1000, 1900)]
+    for y, part in zip((0, 1000, 1900), tops):
+        assert np.array_equal(whole[y:y + 100], part)
+
+
+@pytest.mark.parametrize('size', [(40, 30), (1400, 900)])
+def test_png_roundtrip_small_and_threaded(size):
+    # A large image goes through zlib in pieces, which has to stay one valid stream
+    w, h = size
+    arr = (np.arange(w * h * 3).reshape(h, w, 3) % 251).astype(np.uint8)
+    png = raster.encode_png(arr)
+    pos, idat = 8, []
+    while pos < len(png):
+        n, tag = struct.unpack('>I4s', png[pos:pos + 8])
+        if tag == b'IDAT':
+            idat.append(png[pos + 8:pos + 8 + n])
+        pos += 12 + n
+    raw = zlib.decompress(b''.join(idat))
+    assert raw == np.hstack([np.zeros((h, 1), np.uint8), arr.reshape(h, -1)]).tobytes()
+
+
+def _pdf_streams(data):
+    return [zlib.decompress(m.group(1)) for m in re.finditer(rb'stream\n(.*?)\nendstream', data, re.S)
+            if m.group(1)[:1] == b'\x78']
+
+
+@pytest.mark.parametrize('fill, stroke, even_odd, paint', [(1, 0, False, b'f'), (1, 1, False, b'B'), (0, 1, False, b'S'),
+                                                           (1, 1, True, b'B*'), (1, 0, True, b'f*')])
+def test_markers_are_one_form_in_pdf(fill, stroke, even_odd, paint):
+    target = BytesIO()
+    c = pdfwrite.Canvas(target, pagesize = (100, 100))
+    c.state['even_odd'] = even_odd
+    c.setFillColorRGB(0.5, 0.25, 0.75, alpha = 0.5)
+    c.setStrokeColorRGB(0.1, 0.2, 0.3)
+    c.setLineWidth(2.0)
+    p = c.beginPath()
+    p.moveTo(-1.0, -1.0)
+    p.lineTo(1.0, -1.0)
+    p.lineTo(0.0, 1.0)
+    p.close()
+    c.drawMarkers(p, [10.0, 20.5], [30.0, 40.25], fill = fill, stroke = stroke)
+    # A second batch of the same marker shares the form, an empty one draws nothing
+    c.drawMarkers(p, [50.0], [60.0], fill = fill, stroke = stroke)
+    c.drawMarkers(c.beginPath(), [50.0], [60.0])
+    c.save()
+    data = target.getvalue()
+    assert data.count(b'/Subtype /Form') == 1
+    streams = _pdf_streams(data)
+    page = next(s for s in streams if b'Do Q' in s)
+    assert page.count(b'/M0 Do') == 3 and b'q 1 0 0 1 20.5 40.25 cm /M0 Do Q' in page
+    # The paint operator belongs to the form alone: on the page there is no path left for it to paint
+    assert b'Do Q\n' + paint + b'\n' not in page
+    form = next(s for s in streams if s.endswith(b'\n' + paint))
+    assert form.startswith(b'-1 -1 m')
+    margin = 10 if stroke else 0
+    assert ('/BBox [%d %d %d %d]' % (-1 - margin, -1 - margin, 1 + margin, 1 + margin)).encode() in data
+
+
+def test_shape_too_thin_to_cross_a_sub_scanline_draws_nothing():
+    c = pdfwrite.Canvas(BytesIO(), pagesize = (10, 10))
+    c.setFillColorRGB(0.0, 0.0, 0.0)
+    p = c.beginPath()
+    p.moveTo(1.0, 5.01)
+    p.lineTo(9.0, 5.01)
+    p.lineTo(9.0, 5.02)
+    p.lineTo(1.0, 5.02)
+    p.close()
+    c.drawPath(p, fill = 1, stroke = 0)
+    assert not raster.render(c.ops, 10, 10)[:, :, 3].any()
+
+
+def test_image_alpha_only_gets_a_mask_when_it_has_transparency():
+    for alpha, masks in ((bytes([255]) * 4, 0), (bytes([255, 255, 255, 3]), 1), (None, 0)):
+        target = BytesIO()
+        c = pdfwrite.Canvas(target, pagesize = (10, 10))
+        op = dict(c.state)
+        op.update(kind = 'image', w = 2, h = 2, rgb = bytes(12), alpha = alpha, ctm = (10.0, 0.0, 0.0, 10.0, 0.0, 0.0))
+        c.ops.append(op)
+        c.save()
+        assert target.getvalue().count(b'/SMask') == masks
+
+
+def test_very_large_page_compresses_at_a_lower_level():
+    # Both levels give a valid stream; only the small page keeps level 9, so that GlycoDraw's PDFs stay byte-identical
+    target = BytesIO()
+    c = pdfwrite.Canvas(target, pagesize = (100, 100))
+    p = c.beginPath()
+    p.moveTo(0.0, 0.0)
+    for i in range(120000):
+        p.lineTo(i % 97 + 0.25, i % 89 + 0.5)
+    c.drawPath(p, fill = 0, stroke = 1)
+    c.save()
+    assert len(_pdf_streams(target.getvalue())[0]) > 1 << 20

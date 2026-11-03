@@ -1,9 +1,14 @@
 """Scanline rasterizer for the pdfwrite display list: coverage accumulation with numpy, PNG out via zlib."""
-import math, struct, zlib
+import math, os, struct, zlib
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 SS = 4  # vertical subsamples per pixel; horizontal coverage is analytic
+# A pool lives only as long as its call, so a fork finds no threads gone missing; numpy and zlib release the GIL
+THREADS = min(8, os.cpu_count() or 1)
 _UNIT_CIRCLES = {}
+# A byte's value in [0, 1]: indexing with a byte plane costs less than converting and dividing it
+_BYTES = (np.arange(256) / 255.0).astype(np.float32)
 # Cubic Bernstein weights for every step count flatten() can pick, so a curve costs four multiply-adds, not a linspace
 _BERNSTEIN = {n: ((1 - t)**3, 3*(1 - t)**2*t, 3*(1 - t)*t**2, t**3)
               for n in range(3, 65) for t in [np.linspace(0, 1, n + 1)[1:]]}
@@ -174,6 +179,8 @@ def coverage(edges, x0, y0, w, h, even_odd = False, simple = False):
         return np.minimum(np.maximum(c + (y0 + (c + 0.5) / SS < v) + (y0 + (c + 1.5) / SS < v), 0), rows)
     lo = first(np.minimum(ey0, ey1))
     n = first(np.maximum(ey0, ey1)) - lo
+    # Too thin to cross a sub-scanline: bincount of no crossings gives integers, which the in-place steps below refuse
+    if not n.any(): return np.zeros((h, w), dtype = np.float64)
     # Every crossing found is real, so its edge's values come by np.repeat, which copies runs, rather than by an index
     ri = np.arange(n.sum()) - np.repeat(np.cumsum(n) - n - lo, n)
     # Crossings come edge by edge, so within each sub-scanline they are already in edge order, which is all that
@@ -193,13 +200,13 @@ def coverage(edges, x0, y0, w, h, even_odd = False, simple = False):
     # bincount accumulates in input order exactly like np.add.at, at a fraction of the cost
     chunk = max(SS, int(4e6 // (w + 2)) // SS * SS)
     cov = np.zeros((h, w), dtype = np.float64) if rows > chunk else None
-    for r0 in range(0, rows, chunk):
+    def fill(r0):
         r1 = min(rows, r0 + chunk)
         if cov is None:
             cf, cd, ch = flat, d, hi
         else:
             sel = (ri >= r0) & (ri < r1)
-            if not sel.any(): continue
+            if not sel.any(): return
             cf, cd, ch = flat[sel] - r0 * (w + 2), d[sel], hi[sel]
         acc = np.bincount(np.concatenate([cf, cf + 1]), np.concatenate([cd - ch, ch]),
                           (r1 - r0) * (w + 2)).reshape(r1 - r0, w + 2)
@@ -219,6 +226,10 @@ def coverage(edges, x0, y0, w, h, even_odd = False, simple = False):
             part /= SS
         if cov is None: return part
         cov[r0 // (1 if simple else SS):r1 // (1 if simple else SS)] = part
+    if cov is None: return fill(0)
+    # The bands share nothing, so the result does not depend on who computes which
+    with ThreadPoolExecutor(THREADS) as pool:
+        list(pool.map(fill, range(0, rows, chunk)))
     return cov
 
 
@@ -438,9 +449,11 @@ class Image:
         cov = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd, simple)
         if not cov.any(): return
         kind, geo, stops = grad
-        px, py = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
-        ux = inv[0] * px + inv[2] * py + inv[4]
-        uy = inv[1] * px + inv[3] * py + inv[5]
+        # Without rotation, a coordinate depends on one pixel index only, and a gradient along an axis needs one lookup
+        # per row or column
+        px, py = (np.arange(x0, x1) + 0.5)[None, :], (np.arange(y0, y1) + 0.5)[:, None]
+        ux = inv[0] * px + inv[2] * py + inv[4] if inv[2] else inv[0] * px + inv[4]
+        uy = inv[1] * px + inv[3] * py + inv[5] if inv[1] else inv[3] * py + inv[5]
         if kind == 'radial':
             cx, cy, r = geo
             t = np.hypot(ux - cx, uy - cy) / (r if abs(r) > 1e-9 else 1e-9)
@@ -448,7 +461,8 @@ class Image:
             ax, ay, bx, by = geo
             dx, dy = bx - ax, by - ay
             span = dx * dx + dy * dy
-            t = ((ux - ax) * dx + (uy - ay) * dy) / (span if span > 1e-12 else 1e-12)
+            along = (ux - ax) * dx + (uy - ay) * dy if dx and dy else (ux - ax) * dx if dx else (uy - ay) * dy
+            t = along / (span if span > 1e-12 else 1e-12)
         cr, cg, cb, ca = sample_stops(stops, t)
         a = cov * ca * alpha
         sub = self.buf[:, y0:y1, x0:x1]
@@ -491,6 +505,19 @@ def encode_png(arr, texts = (), dpi = None):
         arr = arr[:, :, :3]  # nothing is transparent, so don't pay for an alpha channel
     h, w = arr.shape[:2]
     raw = np.hstack([np.zeros((h, 1), dtype = np.uint8), arr.reshape(h, -1)]).tobytes()
+    # A large image goes in pieces, each deflated on its own and flushed to a byte boundary; the zlib stream around them
+    # is its header and the checksum of the whole. The pieces lose under half a percent to the shared dictionary.
+    step = max(len(raw) // THREADS + 1, 1 << 20)
+    def deflate(start):
+        packer = zlib.compressobj(6, zlib.DEFLATED, -15)
+        body = packer.compress(raw[start:start + step])
+        return body + packer.flush(zlib.Z_SYNC_FLUSH if start + step < len(raw) else zlib.Z_FINISH)
+    if len(raw) > step:
+        with ThreadPoolExecutor(THREADS) as pool:
+            idat = b'\x78\x9c' + b''.join(pool.map(deflate, range(0, len(raw), step)))
+        idat += struct.pack('>I', zlib.adler32(raw) & 0xFFFFFFFF)
+    else:
+        idat = zlib.compress(raw, 6)
     def chunk(tag, body):
         return struct.pack('>I', len(body)) + tag + body + struct.pack('>I', zlib.crc32(tag + body) & 0xFFFFFFFF)
     out = [b'\x89PNG\r\n\x1a\n', chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6 if arr.shape[2] == 4 else 2, 0, 0, 0))]
@@ -501,7 +528,7 @@ def encode_png(arr, texts = (), dpi = None):
             out.append(chunk(b'tEXt', key.encode('latin-1') + b'\x00' + value.encode('latin-1')))
         except UnicodeEncodeError:  # tEXt is Latin-1 only; iTXt (uncompressed, no language tag) carries UTF-8
             out.append(chunk(b'iTXt', key.encode('latin-1') + b'\x00' * 5 + value.encode('utf-8')))
-    out.append(chunk(b'IDAT', zlib.compress(raw, 6)))
+    out.append(chunk(b'IDAT', idat))
     out.append(chunk(b'IEND', b''))
     return b''.join(out)
 
@@ -688,6 +715,42 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
             y0 = max(0, int(math.floor(max(min(p[1] for p in corners), lo[1]))))
             y1 = min(h, int(math.ceil(min(max(p[1] for p in corners), hi[1]))))
             if x1 <= x0 or y1 <= y0: continue
+            if not (inv[1] or inv[2]):
+                # Without rotation or skew, each column and each row needs its lookup only once, an image on the
+                # output's own grid none at all, and fully transparent pixels no blending
+                u, v = inv[0] * (np.arange(x0, x1) + 0.5) + inv[4], inv[3] * (np.arange(y0, y1) + 0.5) + inv[5]
+                xs, ys = np.flatnonzero((u >= 0) & (u < 1)), np.flatnonzero((v > 0) & (v <= 1))
+                if not (len(xs) and len(ys) and op['fill_alpha'] > 0): continue
+                cols = np.clip((u[xs] * op['w']).astype(np.intp), 0, op['w'] - 1)
+                rows = np.clip(((1 - v[ys]) * op['h']).astype(np.intp), 0, op['h'] - 1)
+                x0, x1, y0, y1 = x0 + xs[0], x0 + xs[-1] + 1, y0 + ys[0], y0 + ys[-1] + 1
+                on_grid = (np.diff(cols) == 1).all() and (np.diff(rows) == 1).all()
+                def pick(plane):
+                    return plane[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1] if on_grid else plane[rows][:, cols]
+                rgb = pick(np.frombuffer(op['rgb'], np.uint8).reshape(op['h'], op['w'], 3))
+                alpha = op['alpha'] and pick(np.frombuffer(op['alpha'], np.uint8).reshape(op['h'], op['w']))
+                covered = rgb.shape[0] * rgb.shape[1] if alpha is None else np.count_nonzero(alpha)
+                if not covered: continue
+                # A sparse layer, such as a few points stamped onto a page, blends only its covered pixels; gathering a
+                # pixel costs about eight times what blending one in the whole box does
+                if 8 * covered <= rgb.shape[0] * rgb.shape[1]:
+                    ys, xs = np.nonzero(alpha)
+                    a = _BYTES[alpha[ys, xs]] * op['fill_alpha']
+                    col = _BYTES[rgb[ys, xs]].T
+                    ys += y0
+                    xs += x0
+                    img.buf[:3, ys, xs] = img.buf[:3, ys, xs] * (1 - a) + col * a
+                    img.buf[3, ys, xs] = img.buf[3, ys, xs] * (1 - a) + a
+                    continue
+                a = np.float32(op['fill_alpha']) if alpha is None else _BYTES[alpha] * op['fill_alpha']
+                # In place, plane by plane: the whole box, so temporaries cost more than the arithmetic
+                sub, rest = img.buf[:, y0:y1, x0:x1], 1 - a
+                for c in range(3):
+                    sub[c] *= rest
+                    sub[c] += _BYTES[rgb[:, :, c]] * a
+                sub[3] *= rest
+                sub[3] += a
+                continue
             px, py = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
             u, v = inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]
             col = np.clip((u * op['w']).astype(np.intp), 0, op['w'] - 1)
@@ -695,7 +758,6 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
             a = ((u >= 0) & (u < 1) & (v > 0) & (v <= 1)) * op['fill_alpha']
             if op['alpha'] is not None:
                 a = a * np.frombuffer(op['alpha'], np.uint8).reshape(op['h'], op['w'])[row, col] / 255.0
-            a3, sub = a[:, :, None], img.buf[y0:y1, x0:x1]
             sub = img.buf[:, y0:y1, x0:x1]
             sub[:3] = sub[:3] * (1 - a) + np.frombuffer(op['rgb'], np.uint8).reshape(
                 op['h'], op['w'], 3)[row, col].transpose(2, 0, 1) / 255.0 * a

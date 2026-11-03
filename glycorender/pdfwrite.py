@@ -295,6 +295,14 @@ class Canvas:
                   size=self._size, char_space=charSpace)
         self.ops.append(op)
 
+    def drawMarkers(self, path, xs, ys, fill=1, stroke=0):
+        """One path, written around its own origin, painted with the current state at each (x, y). For PDF output only,
+        where the path is stored once as a form, as matplotlib does: to_png and to_svg do not take this op."""
+        if not path.ops: return
+        op = dict(self.state)
+        op.update(kind='markers', path=list(path.ops), xs=xs, ys=ys, fill=bool(fill), stroke=bool(stroke))
+        self.ops.append(op)
+
     def drawImage(self, png):
         """PNG bytes onto the unit square of the current user space, first row at the top, as PDF images go.
 
@@ -377,7 +385,7 @@ class Canvas:
                 xs.append(seg[i])
                 ys.append(seg[i + 1])
         return (min(xs), min(ys), max(xs), max(ys))
-    def _content(self, alphas, shadings, images):
+    def _content(self, alphas, shadings, images, forms):
         buf = []
         for op in self.ops:
             buf.append('q')
@@ -387,11 +395,17 @@ class Canvas:
                 buf.append('%s %s %s %s re W n' % tuple(_fmt(v) for v in box))
                 cur = ctm
             buf.append('%s %s %s %s %s %s cm' % tuple(_fmt(v) for v in _mul(op['ctm'], _inv(cur))))
-            if op['kind'] == 'path':
+            if op['kind'] == 'path' or op['kind'] == 'markers':
                 grad = op.get('fill_grad')
                 path = [_PDF_OP[seg[0]] % tuple(_fmt(v) for v in seg[1:]) if len(seg) > 1 else _PDF_OP[seg[0]]
                         for seg in op['path']]
                 eo = '*' if op.get('even_odd') else ''
+                if op['kind'] == 'markers':
+                    # A form inherits the color, alpha, and line width set below; its box depends on that line width
+                    paint = ('B' + eo) if (op['fill'] and op['stroke']) else ('f' + eo) if op['fill'] else 'S'
+                    name = forms.setdefault((tuple(op['path']), paint, op['line_width'] if op['stroke'] else 0.0),
+                                            'M%d' % len(forms))
+                    path = ['q 1 0 0 1 %s %s cm /%s Do Q' % (_fmt(x), _fmt(y), name) for x, y in zip(op['xs'], op['ys'])]
                 if op['fill'] and grad:  # paint the shading through the shape used as a clip
                     idx = _grad_index(shadings, grad, self._path_bbox(op['path'], grad), op['fill_alpha'])
                     buf.append('q')
@@ -412,7 +426,8 @@ class Canvas:
                     if op['dash']:
                         buf.append('[%s] %s d' % (' '.join(_fmt(v) for v in op['dash'][0]), _fmt(op['dash'][1])))
                 buf.extend(path)
-                buf.append(('B' + eo) if (solid and op['stroke']) else ('f' + eo) if solid else 'S')
+                if op['kind'] == 'path':
+                    buf.append(('B' + eo) if (solid and op['stroke']) else ('f' + eo) if solid else 'S')
             elif op['kind'] == 'image':
                 buf.append('/%s gs /Im%d Do' % (_alpha_name(alphas, op['fill_alpha'], False), len(images)))
                 images.append(op)
@@ -527,15 +542,15 @@ class Canvas:
                         '/DescendantFonts [%d 0 R] /ToUnicode %d 0 R >>' % (base, cid, tou)).encode())
     def save(self):
         out = _Writer()
-        alphas, shadings, images = {}, {}, []
-        body = self._content(alphas, shadings, images)
+        alphas, shadings, images, forms = {}, {}, [], {}
+        body = self._content(alphas, shadings, images, forms)
         shadow, sticker = self._effects()
         if sticker:
             body = self._sticker_content(alphas, sticker) + '\n' + body
         xobj = ''
         for i, op in enumerate(images):
             smask = ''
-            if op['alpha'] is not None and min(op['alpha']) < 255:
+            if op['alpha'] is not None and op['alpha'].count(255) < len(op['alpha']):
                 packed = zlib.compress(op['alpha'], 6)
                 smask = '/SMask %d 0 R ' % out.add(
                     ('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 8 '
@@ -546,10 +561,23 @@ class Canvas:
                 ('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB /BitsPerComponent 8 '
                  '%s/Filter /FlateDecode /Length %d >>\nstream\n' % (op['w'], op['h'], smask, len(packed))).encode()
                 + packed + b'\nendstream'))
+        for (path, paint, width), name in forms.items():
+            # Past the path's own points by as far as a miter at the default limit can reach
+            xs = [seg[i] for seg in path for i in range(1, len(seg), 2)]
+            ys = [seg[i] for seg in path for i in range(2, len(seg), 2)]
+            bbox = ' '.join(_fmt(v) for v in (min(xs) - 5 * width, min(ys) - 5 * width, max(xs) + 5 * width,
+                                              max(ys) + 5 * width))
+            draw = [_PDF_OP[seg[0]] % tuple(_fmt(v) for v in seg[1:]) if len(seg) > 1 else _PDF_OP[seg[0]]
+                    for seg in path]
+            packed = zlib.compress('\n'.join(draw + [paint]).encode('latin-1'), 9)
+            xobj += '/%s %d 0 R ' % (name, out.add(('<< /Type /XObject /Subtype /Form /BBox [%s] /Filter /FlateDecode '
+                                                    '/Length %d >>\nstream\n' % (bbox, len(packed))).encode()
+                                                   + packed + b'\nendstream'))
         if shadow:
             xobj += '/Shadow %d 0 R' % self._shadow_object(out, shadow, sticker)
             body = 'q %s 0 0 %s 0 0 cm /Shadow Do Q\n' % (_fmt(self.width), _fmt(self.height)) + body
-        content = zlib.compress(body.encode('latin-1'), 9)
+        # Level 9 gains a percent or two over 6 at twice the time, which only a very large page would notice
+        content = zlib.compress(body.encode('latin-1'), 9 if len(body) < 1 << 20 else 6)
         stream = out.add(b'<< /Length %d /Filter /FlateDecode >>\nstream\n' % len(content) + content + b'\nendstream')
         fonts = ' '.join('/%s %d 0 R' % (n, self._font_objects(out, n, f)) for n, f in self.used.items())
         gs = [('/%s << /Type /ExtGState /%s %s >>' % (n, 'CA' if k[1] else 'ca', _fmt(k[0]))) for k, n in
