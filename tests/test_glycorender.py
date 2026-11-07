@@ -1,7 +1,8 @@
 """Tests for glycorender: the SVG subset GlycoDraw emits, and the PNG/PDF/SVG backends."""
-import base64, os, re, struct, zlib
+import base64, math, os, re, struct, zlib
 from io import BytesIO
 from types import SimpleNamespace
+from unittest.mock import patch
 import numpy as np
 import pytest
 from glycorender import pdfwrite, raster, svgdraw, ttf
@@ -381,7 +382,17 @@ def test_embedded_png_images_reach_png_and_pdf(tmp_path):
     assert b'/Im0 Do' in b''.join(streams) and b'/Im1 Do' in b''.join(streams)
     # Both images become XObjects, but only the translucent one needs a soft mask
     assert data.count(b'/Subtype /Image') == 3 and data.count(b'/SMask') == 1
-    assert rgba[:, :, :3].tobytes() in streams and rgba[:, :, 3].tobytes() in streams
+    # Their rows come filtered as in a PNG, by None or Up
+    assert data.count(b'/Predictor 15') == 3
+    def rows(stream, stride):
+        out, prev = [], np.zeros(stride, np.uint8)
+        for r in range(len(stream) // (stride + 1)):
+            line = np.frombuffer(stream[r * (stride + 1) + 1:(r + 1) * (stride + 1)], np.uint8)
+            prev = line + prev if stream[r * (stride + 1)] == 2 else line.copy()
+            out.append(prev.tobytes())
+        return b''.join(out)
+    assert rgba[:, :, :3].tobytes() in [rows(s, 6) for s in streams if len(s) == 14]
+    assert rgba[:, :, 3].tobytes() in [rows(s, 2) for s in streams if len(s) == 6]
 
 
 def test_labels_never_read_right_to_left():
@@ -528,6 +539,72 @@ def test_large_path_coverage_matches_by_band():
         assert np.array_equal(whole[y:y + 100], part)
 
 
+def _star(n, r):
+    return [[(1000 + r * math.cos(k * n * math.pi / 5), 1000 + r * math.sin(k * n * math.pi / 5)) for k in range(6)]]
+
+
+@pytest.mark.parametrize('shape', ['stroke', 'clipped', 'ring', 'star_nonzero', 'star_even_odd', 'two_rings', 'disc'])
+def test_sparse_coverage_equals_the_whole_array(shape):
+    # Thin ink over a large box comes back as its covered pixels, which must be exactly the array's nonzero ones
+    t = np.linspace(0.0, 40.0, 400)
+    line = [list(zip((50.0 + t * 45.0).tolist(), (1000.0 + 900.0 * np.sin(t)).tolist()))]
+    ring = raster._arc(1000, 1000, 900)
+    simple, even_odd, box = False, False, (0, 0, 1900, 2000)
+    if shape in ('stroke', 'clipped'):
+        edges = raster._edges(raster.stroke_polys(line, 6.0, 1, 1), True)
+        # A box that ends before the ink does clips its crossings to its right side
+        box = (0, 0, 1900, 2000) if shape == 'stroke' else (37, 13, 1500, 1900)
+    elif shape == 'ring':
+        edges, simple = raster._outline([ring + [ring[0]]], 4.0, 1, 1), True
+    elif shape == 'disc':
+        edges, simple = raster._edges([ring], True), True
+    elif shape == 'two_rings':
+        edges = raster._edges(raster.stroke_polys([ring + [ring[0]], raster._arc(1000, 1000, 500)[::-1]], 9.0, 0, 0),
+                              True)
+    else:
+        edges, even_odd = raster._edges(_star(4, 950), True), shape == 'star_even_odd'
+    whole = raster.coverage(edges, *box, even_odd, simple)
+    found = raster.coverage(edges, *box, even_odd, simple, True)
+    if shape == 'disc':
+        # Mostly covered, so the whole array comes back
+        assert isinstance(found, np.ndarray) and np.array_equal(found, whole)
+        return
+    ys, xs, v = found
+    assert len(ys) == np.count_nonzero(whole) and len(set((ys * box[2] + xs).tolist())) == len(ys)
+    assert np.array_equal(whole[ys, xs], v)
+
+
+def test_sparse_coverage_paints_the_same_pixels():
+    t = np.linspace(0.0, 40.0, 400)
+    c = pdfwrite.Canvas(BytesIO(), pagesize = (500, 500))
+    c.setStrokeColorRGB(0.1, 0.5, 0.6, alpha = 0.3)
+    c.setLineWidth(3.0)
+    p = c.beginPath()
+    p.moveTo(10, 250)
+    for x, y in zip(10 + t * 12, 250 + 220 * np.sin(t)):
+        p.lineTo(x, y)
+    c.drawPath(p, fill = 0, stroke = 1)
+    sparse = raster.render(c.ops, 500, 500, 4.0, 4.0, (1.0, 1.0, 1.0))
+    with patch.object(raster, 'SPARSE_MIN', 1 << 40):
+        assert np.array_equal(sparse, raster.render(c.ops, 500, 500, 4.0, 4.0, (1.0, 1.0, 1.0)))
+
+
+def test_a_layer_goes_under_the_drawing():
+    c = pdfwrite.Canvas(BytesIO(), pagesize = (10, 10))
+    c.setFillColorRGB(1.0, 0.0, 0.0)
+    c.rect(0, 0, 5, 10, fill = 1, stroke = 0)
+    # Half-transparent blue over the whole page, as premultiplied planes, from the third row and second column on
+    planes = np.zeros((4, 10, 10), np.float32)
+    planes[2], planes[3] = 0.5, 0.5
+    got = raster.render(c.ops, 10, 10, 1.0, 1.0, (1.0, 1.0, 1.0), under = lambda: (2, 1, planes))
+    assert tuple(got[5, 2]) == (255, 0, 0) and tuple(got[0, 7]) == (255, 255, 255)
+    assert tuple(got[5, 7]) == (128, 128, 255) and tuple(got[1, 7]) == (255, 255, 255)
+    # A layer reaching past the page is cut to it, and nothing at all is the same as no layer
+    assert raster.render(c.ops, 10, 10, 1.0, 1.0, None, under = (-3, 8, planes)).shape == (10, 10, 4)
+    assert np.array_equal(raster.render(c.ops, 10, 10, 1.0, 1.0, None, under = lambda: None),
+                          raster.render(c.ops, 10, 10, 1.0, 1.0, None))
+
+
 @pytest.mark.parametrize('size', [(40, 30), (1400, 900)])
 def test_png_roundtrip_small_and_threaded(size):
     # A large image goes through zlib in pieces, which has to stay one valid stream
@@ -541,7 +618,22 @@ def test_png_roundtrip_small_and_threaded(size):
             idat.append(png[pos + 8:pos + 8 + n])
         pos += 12 + n
     raw = zlib.decompress(b''.join(idat))
-    assert raw == np.hstack([np.zeros((h, 1), np.uint8), arr.reshape(h, -1)]).tobytes()
+    assert len(raw) == h * (w * 3 + 1) and set(raw[::w * 3 + 1]) <= {0, 2}
+    c = pdfwrite.Canvas(None, pagesize = (1, 1))
+    c.drawImage(png)
+    assert c.ops[0]['rgb'] == arr.tobytes()
+
+
+def test_png_filters_each_band_by_what_packs_smaller():
+    # A soft blur packs far smaller as differences to the row above, noise as it is
+    y, x = np.mgrid[:600, :800]
+    smooth = (128 + 100 * np.sin(x / 50.0) * np.cos(y / 70.0))[..., None].repeat(3, axis = 2).astype(np.uint8)
+    noise = np.random.default_rng(0).integers(0, 256, (600, 800, 3), dtype = np.uint8)
+    for arr, kind in ((smooth, 2), (noise, 0)):
+        png = raster.encode_png(arr)
+        raw = zlib.decompress(png[png.index(b'IDAT') + 4:png.index(b'IEND') - 8])
+        assert set(raw[::800 * 3 + 1]) == {kind}
+    assert len(raster.encode_png(smooth)) < 0.95 * len(zlib.compress(smooth.tobytes(), 6))
 
 
 def _pdf_streams(data):
@@ -616,3 +708,12 @@ def test_very_large_page_compresses_at_a_lower_level():
     c.drawPath(p, fill = 0, stroke = 1)
     c.save()
     assert len(_pdf_streams(target.getvalue())[0]) > 1 << 20
+
+def test_a_page_of_millions_of_pixels_converts_in_parts_alike():
+    c = pdfwrite.Canvas(BytesIO(), pagesize = (300, 300))
+    c.setFillGradient('radial', (150, 150, 200), [(0.0, (0.9, 0.2, 0.1, 0.9)), (1.0, (0.1, 0.3, 0.8, 0.4))])
+    c.rect(0, 0, 300, 300, fill = 1, stroke = 0)
+    for background in ((1.0, 1.0, 1.0), None):
+        parts = raster.render(c.ops, 300, 300, 4.0, 4.0, background)
+        with patch.object(raster, 'THREADS', 1):
+            assert np.array_equal(parts, raster.render(c.ops, 300, 300, 4.0, 4.0, background))

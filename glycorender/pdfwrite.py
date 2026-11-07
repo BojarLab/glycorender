@@ -548,19 +548,21 @@ class Canvas:
         if sticker:
             body = self._sticker_content(alphas, sticker) + '\n' + body
         xobj = ''
+        from .raster import deflate_rows
         for i, op in enumerate(images):
             smask = ''
+            # Rows filtered as in a PNG, which a soft shadow or a smooth heatmap packs far tighter with
             if op['alpha'] is not None and op['alpha'].count(255) < len(op['alpha']):
-                packed = zlib.compress(op['alpha'], 6)
+                packed = deflate_rows(op['alpha'], op['h'])
                 smask = '/SMask %d 0 R ' % out.add(
                     ('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 8 '
-                     '/Filter /FlateDecode /Length %d >>\nstream\n' % (op['w'], op['h'], len(packed))).encode()
-                    + packed + b'\nendstream')
-            packed = zlib.compress(op['rgb'], 6)
+                     '/Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns %d >> /Length %d >>\nstream\n'
+                     % (op['w'], op['h'], op['w'], len(packed))).encode() + packed + b'\nendstream')
+            packed = deflate_rows(op['rgb'], op['h'])
             xobj += '/Im%d %d 0 R ' % (i, out.add(
                 ('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB /BitsPerComponent 8 '
-                 '%s/Filter /FlateDecode /Length %d >>\nstream\n' % (op['w'], op['h'], smask, len(packed))).encode()
-                + packed + b'\nendstream'))
+                 '%s/Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors 3 /Columns %d >> /Length %d >>\nstream\n'
+                 % (op['w'], op['h'], smask, op['w'], len(packed))).encode() + packed + b'\nendstream'))
         for (path, paint, width), name in forms.items():
             # Past the path's own points by as far as a miter at the default limit can reach
             xs = [seg[i] for seg in path for i in range(1, len(seg), 2)]

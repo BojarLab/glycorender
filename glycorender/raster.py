@@ -4,6 +4,12 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 SS = 4  # vertical subsamples per pixel; horizontal coverage is analytic
+# From a box of this many pixels on, coverage asked for as sparse is computed on tiles of TILE by TILE pixels, only
+# where an edge crosses one or the winding inside one is not zero, as long as those tiles are under SPARSE_SHARE of the
+# box
+SPARSE_MIN, TILE, SPARSE_SHARE = 1 << 16, 16, 0.5
+# Bytes of rows per band of a PNG, each filtered and deflated on its own, on threads
+BAND = 1 << 19
 # A pool lives only as long as its call, so a fork finds no threads gone missing; numpy and zlib release the GIL
 THREADS = min(8, os.cpu_count() or 1)
 _UNIT_CIRCLES = {}
@@ -160,13 +166,15 @@ def _outline(subs, hw, cap, join, filled = False):
     return _loops(outer, inner[::-1])
 
 
-def coverage(edges, x0, y0, w, h, even_odd = False, simple = False):
+def coverage(edges, x0, y0, w, h, even_odd = False, simple = False, sparse = False):
     """Antialiased coverage of `edges` over the pixel box at (x0,y0), size (w,h).
 
     Each pixel row is sampled at SS sub-scanlines; within a row the crossings are
     splatted at fractional x, so horizontal antialiasing is exact rather than sampled.
     `simple` promises a winding number that is only ever 0 or one sign of 1 (a convex
     polygon, an annulus), so the sub-scanlines can be summed before the running sum.
+    With `sparse`, a large box whose ink is thin, such as a long line, gives (rows,
+    columns, values) of its covered pixels instead of the whole array.
     """
     if not len(edges) or w <= 0 or h <= 0: return np.zeros((h, w), dtype = np.float64)
     ex0, ey0, ex1, ey1 = edges[:, 0], edges[:, 1], edges[:, 2], edges[:, 3]
@@ -196,6 +204,66 @@ def coverage(edges, x0, y0, w, h, even_odd = False, simple = False):
         # Summed over its sub-scanlines first, a pixel row needs one running sum instead of SS
         ri //= SS
         rows = h
+    sub = 1 if simple else SS
+    if sparse and w * h >= SPARSE_MIN:
+        # Tiles of TILE pixels square, each TILE * sub rows of the running sum. A tile no edge crosses holds, on each
+        # of its rows, the winding at its left side, which the crossings in the tiles to its left add up to in whole
+        # numbers
+        ntr, ntc, th = -(-h // TILE), -(-w // TILE), TILE * sub
+        # A crossing clipped to the right side only reaches cells past the box
+        if (ix >= w).any():
+            keep = ix < w
+            ri, ix, d, hi = ri[keep], ix[keep], d[keep], hi[keep]
+        tr, tc = ri // th, ix // TILE
+        # Running sums along the long axis of an array run several times faster than along a short one
+        wind = np.bincount(tc * rows + ri, d, ntc * rows).reshape(ntc, rows)
+        start = np.zeros((ntc, ntr * th))
+        start[1:, :rows] = np.cumsum(wind[:-1], axis = 0)
+        tile = tr * ntc + tc
+        crossed = np.bincount(tile, minlength = ntr * ntc) > 0
+        level = (np.minimum(np.abs(start) / SS, 1.0) if simple else np.abs(start) % 2.0 if even_odd else
+                 np.minimum(np.abs(start), 1.0))
+        # Each pixel row's coverage in a tile without crossings, the same across the tile
+        flat_rows = sum(level[:, s::sub] for s in range(sub)) / sub
+        filled = ~crossed & (flat_rows.reshape(ntc, ntr, TILE).any(axis = 2).T.ravel())
+        if (crossed.sum() + filled.sum()) * TILE * TILE <= SPARSE_SHARE * w * h:
+            slot = np.cumsum(crossed) - 1
+            # Within a tile, sub-scanline s of pixel row y is row s * TILE + y, so that the SS rows of a pixel row are
+            # slices rather than a short axis
+            local = ri - tr * th
+            cell = ((slot[tile] * (TILE + 1) + ix - tc * TILE) * th + local % sub * TILE + local // sub)
+            act = np.flatnonzero(crossed)
+            at, ac = act // ntc, act % ntc
+            perm = np.arange(th) % TILE * sub + np.arange(th) // TILE
+            def band(g):
+                # Tile rows from g on, as many as make up their share of the crossed tiles; each its own running sums
+                lo, hi_ = np.searchsorted(at, (g, g + step))
+                if lo == hi_: return None
+                mine = (tr >= g) & (tr < g + step)
+                acc = np.bincount(np.concatenate([cell[mine], cell[mine] + th]) - lo * (TILE + 1) * th,
+                                  np.concatenate([d[mine] - hi[mine], hi[mine]]),
+                                  (hi_ - lo) * (TILE + 1) * th).reshape(hi_ - lo, TILE + 1, th)
+                acc[:, 0] += start[ac[lo:hi_, None], at[lo:hi_, None] * th + perm]
+                run = np.abs(np.cumsum(acc, axis = 1, out = acc)[:, :TILE])
+                if simple:
+                    cov = np.minimum(run / SS, 1.0, out = run)
+                else:
+                    m = run % 2.0 if even_odd else run
+                    m = np.minimum(m, 2.0 - m) if even_odd else np.minimum(m, 1.0, out = m)
+                    cov = sum(m[:, :, s * TILE:(s + 1) * TILE] for s in range(SS)) / SS
+                k, px, py = np.nonzero(cov)
+                return at[lo + k] * TILE + py, ac[lo + k] * TILE + px, cov[k, px, py]
+            step = max(1, -(-ntr // THREADS))
+            with ThreadPoolExecutor(THREADS) as pool:
+                parts = [p for p in pool.map(band, range(0, ntr, step)) if p is not None]
+            # Tiles inside a fill, row by row
+            fc, fy = np.nonzero(flat_rows * np.repeat(filled.reshape(ntr, ntc).T, TILE, axis = 1))
+            if len(fc):
+                parts.append((np.repeat(fy, TILE), (fc[:, None] * TILE + np.arange(TILE)).ravel(),
+                              np.repeat(flat_rows[fc, fy], TILE)))
+            ys, xs, vs = (np.concatenate(v) for v in zip(*parts)) if parts else (np.zeros(0, np.intp),) * 3
+            within = (ys < h) & (xs < w)
+            return ys[within], xs[within], vs[within]
     flat = ri * (w + 2) + ix
     # bincount accumulates in input order exactly like np.add.at, at a fraction of the cost
     chunk = max(SS, int(4e6 // (w + 2)) // SS * SS)
@@ -417,24 +485,36 @@ class Image:
         y0 = max(0, int(math.floor(max(ye.min(), lo[1]))))
         y1 = min(self.h, int(math.ceil(min(ye.max(), hi[1]))) + 1)
         if x1 <= x0 or y1 <= y0: return
-        a = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd, simple).astype(np.float32)
-        if alpha != 1:
-            a *= alpha
-        covered = np.count_nonzero(a)
-        if not covered: return
+        a = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd, simple, True)
         col = np.append(np.asarray(rgb, dtype = np.float32), np.float32(1.0))
-        # A mostly covered box (a figure or axes background, a square symbol) blends fastest as one slice
-        if 2 * covered > a.size:
-            sub = self.buf[:, y0:y1, x0:x1]
-            sub *= 1 - a
-            sub += col[:, None, None] * a
-            return
-        # Otherwise blend only the covered pixels; the edge box of a slanted linkage is mostly empty
-        ys, xs = np.nonzero(a)
-        v = a[ys, xs]
-        ys += y0
-        xs += x0
-        self.buf[:, ys, xs] = self.buf[:, ys, xs] * (1 - v) + col[:, None] * v
+        if isinstance(a, tuple):
+            # Thin ink over a large box comes as its covered pixels alone
+            ys, xs, v = a
+            v = v.astype(np.float32)
+            if alpha != 1:
+                v *= alpha
+        else:
+            a = a.astype(np.float32)
+            if alpha != 1:
+                a *= alpha
+            covered = np.count_nonzero(a)
+            if not covered: return
+            # A mostly covered box (a figure or axes background, a square symbol) blends fastest as one slice
+            if 2 * covered > a.size:
+                sub = self.buf[:, y0:y1, x0:x1]
+                sub *= 1 - a
+                sub += col[:, None, None] * a
+                return
+            # Otherwise blend only the covered pixels; the edge box of a slanted linkage is mostly empty
+            ys, xs = np.nonzero(a)
+            v = a[ys, xs]
+        # By flat index, which gathers and scatters several times faster than a pair of index arrays
+        idx = (ys + y0) * self.w + xs + x0
+        flat = self.buf.reshape(4, -1)
+        sub = flat[:, idx]
+        sub *= 1 - v
+        sub += col[:, None] * v
+        flat[:, idx] = sub
     def paint_grad(self, edges, grad, ctm, alpha, even_odd = False, box = None, simple = False):
         """Fill `edges` with a radial gradient evaluated per pixel in the op's user space."""
         inv = _inv(ctm)
@@ -465,23 +545,26 @@ class Image:
             t = along / (span if span > 1e-12 else 1e-12)
         cr, cg, cb, ca = sample_stops(stops, t)
         a = cov * ca * alpha
-        sub = self.buf[:, y0:y1, x0:x1]
-        sub[:3] = sub[:3] * (1 - a) + np.stack([cr, cg, cb]) * a
-        sub[3] = sub[3] * (1 - a) + a
+        sub, rest = self.buf[:, y0:y1, x0:x1], 1 - a
+        # Plane by plane, the same arithmetic with a third of the temporaries
+        for c, v in enumerate((cr, cg, cb)):
+            sub[c] = sub[c] * rest + v * a
+        sub[3] = sub[3] * rest + a
     def rgb(self, background = None):
         # Only the inked pixels are computed, gathered by flat index, as a figure is mostly empty page
         flat = self.buf.reshape(4, -1)
         if background is None:  # keep the alpha channel; the buffer is premultiplied
             # Un-premultiply only the inked pixels; everything else is (0, 0, 0, 0)
             out = np.zeros((self.h * self.w, 4), dtype = np.uint8)
-            idx = np.flatnonzero(flat[3] > 1e-6)
-            px = flat[:, idx]
-            v = np.empty((len(idx), 4))
-            v[:, :3] = (px[:3] / px[3]).T
-            v[:, 3] = px[3]
-            v *= 255.0
-            v += 0.5
-            out[idx] = np.clip(v, 0, 255, out = v).astype(np.uint8)
+            def straight(idx):
+                px = flat[:, idx]
+                v = np.empty((len(idx), 4))
+                v[:, :3] = (px[:3] / px[3]).T
+                v[:, 3] = px[3]
+                v *= 255.0
+                v += 0.5
+                out[idx] = np.clip(v, 0, 255, out = v).astype(np.uint8)
+            _in_parts(straight, np.flatnonzero(flat[3] > 1e-6))
             return out.reshape(self.h, self.w, 4)
         # Untouched pixels hold zero colour and zero alpha, so they come out as the background colour itself
         bg = np.asarray(background, dtype = np.float64)
@@ -489,14 +572,60 @@ class Image:
         out = np.empty((self.h, self.w * 3), dtype = np.uint8)
         out[...] = np.tile(np.clip(bg * 255.0 + 0.5, 0, 255).astype(np.uint8), self.w)
         out = out.reshape(-1, 3)
-        idx = np.flatnonzero(flat[3] != 0)
-        px = flat[:, idx]
-        v = (1 - px[3]) * bg[:, None]
-        v += px[:3]
-        v *= 255.0
-        v += 0.5
-        out[idx] = np.clip(v, 0, 255, out = v).astype(np.uint8).T
+        def over(idx):
+            px = flat[:, idx]
+            v = (1 - px[3]) * bg[:, None]
+            v += px[:3]
+            v *= 255.0
+            v += 0.5
+            out[idx] = np.clip(v, 0, 255, out = v).astype(np.uint8).T
+        _in_parts(over, np.flatnonzero(flat[3] != 0))
         return out.reshape(self.h, self.w, 3)
+
+
+def _in_parts(work, idx):
+    """`work` on the flat pixel indices, in parts on threads when there are millions: each pixel is its own, so the
+    result is the same."""
+    parts = np.array_split(idx, max(1, min(THREADS, len(idx) >> 18)))
+    if len(parts) == 1:
+        work(idx)
+        return
+    with ThreadPoolExecutor(len(parts)) as pool:
+        list(pool.map(work, parts))
+
+
+def deflate_rows(rows, h):
+    """A zlib stream of `h` rows of bytes, from an array or a bytes object, each row led by its PNG filter byte, as
+    PNG's IDAT and PDF's /Predictor 15 read them.
+
+    The rows go in bands, each deflated on its own and flushed to a byte boundary, with each row as it is (filter None)
+    or as its difference to the row above (Up), whichever packs smaller: Up halves flat fills, bars, lines, and soft
+    shadows, None keeps dense scatters and glycans as small as they were. Both are deflated, each on a thread of its
+    own, as a sample of the rows chose Up for glycans where None packed smaller. The stream around the bands is its
+    header and the checksum of the whole.
+    """
+    rows = np.frombuffer(rows, np.uint8).reshape(h, -1) if isinstance(rows, bytes) else rows.reshape(h, -1)
+    band = max(1, BAND // max(rows.shape[1], 1))
+    def deflate(job):
+        r0, kind = job
+        body = rows[r0:r0 + band]
+        if kind:
+            above = np.empty_like(body)
+            above[0] = rows[r0 - 1] if r0 else 0
+            above[1:] = body[:-1]
+            body = body - above
+        raw = np.hstack([np.full((len(body), 1), kind, np.uint8), body]).tobytes()
+        packer = zlib.compressobj(6, zlib.DEFLATED, -15)
+        return packer.compress(raw) + packer.flush(zlib.Z_SYNC_FLUSH if r0 + band < h else zlib.Z_FINISH), raw
+    # Twice the usual threads, as each band has two candidates
+    with ThreadPoolExecutor(2 * THREADS) as pool:
+        done = list(pool.map(deflate, [(r0, kind) for r0 in range(0, h, band) for kind in (0, 2)]))
+    # None where the two tie
+    bands = [min(done[i], done[i + 1], key = lambda d: len(d[0])) for i in range(0, len(done), 2)]
+    check = 1
+    for _, raw in bands:
+        check = zlib.adler32(raw, check)
+    return b'\x78\x9c' + b''.join(packed for packed, _ in bands) + struct.pack('>I', check & 0xFFFFFFFF)
 
 
 def encode_png(arr, texts = (), dpi = None):
@@ -504,20 +633,7 @@ def encode_png(arr, texts = (), dpi = None):
     if arr.shape[2] == 4 and arr[:, :, 3].min() == 255:
         arr = arr[:, :, :3]  # nothing is transparent, so don't pay for an alpha channel
     h, w = arr.shape[:2]
-    raw = np.hstack([np.zeros((h, 1), dtype = np.uint8), arr.reshape(h, -1)]).tobytes()
-    # A large image goes in pieces, each deflated on its own and flushed to a byte boundary; the zlib stream around them
-    # is its header and the checksum of the whole. The pieces lose under half a percent to the shared dictionary.
-    step = max(len(raw) // THREADS + 1, 1 << 20)
-    def deflate(start):
-        packer = zlib.compressobj(6, zlib.DEFLATED, -15)
-        body = packer.compress(raw[start:start + step])
-        return body + packer.flush(zlib.Z_SYNC_FLUSH if start + step < len(raw) else zlib.Z_FINISH)
-    if len(raw) > step:
-        with ThreadPoolExecutor(THREADS) as pool:
-            idat = b'\x78\x9c' + b''.join(pool.map(deflate, range(0, len(raw), step)))
-        idat += struct.pack('>I', zlib.adler32(raw) & 0xFFFFFFFF)
-    else:
-        idat = zlib.compress(raw, 6)
+    idat = deflate_rows(arr, h)
     def chunk(tag, body):
         return struct.pack('>I', len(body)) + tag + body + struct.pack('>I', zlib.crc32(tag + body) & 0xFFFFFFFF)
     out = [b'\x89PNG\r\n\x1a\n', chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6 if arr.shape[2] == 4 else 2, 0, 0, 0))]
@@ -660,8 +776,14 @@ def shadow_alpha(ops, width, height, shadow, sticker = None, dpi = 150.0):
     return w, h, rows.tobytes()
 
 
-def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, shadow = None, sticker = None):
-    """Rasterize a pdfwrite display list; `background` None keeps alpha. PDF y-up is flipped to image y-down here."""
+def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, shadow = None, sticker = None,
+           under = None):
+    """Rasterize a pdfwrite display list; `background` None keeps alpha. PDF y-up is flipped to image y-down here.
+
+    `under` is a layer that goes under the whole drawing, (top row, left column, premultiplied RGBA planes of shape
+    (4, rows, columns)) in device pixels, or a function giving it, which is called once the drawing is done so that the
+    layer can be computed alongside, such as a soft shadow on another thread.
+    """
     w = max(1, int(round(width * scale_x)))
     h = max(1, int(round(height * scale_y)))
     flip = (scale_x, 0.0, 0.0, -scale_y, 0.0, float(h))
@@ -767,4 +889,16 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
             for cmds, gctm in _glyph_paths(op, ctm):
                 subs.extend(flatten(cmds, gctm))
             if subs: img.paint(_edges(subs, True), op['fill_rgb'], op['fill_alpha'], False, box)
+    layer = under() if callable(under) else under
+    if layer is not None:
+        top, left, planes = layer
+        planes = planes[:, max(0, -top):h - top, max(0, -left):w - left]
+        sub = img.buf[:, max(0, top):max(0, top) + planes.shape[1], max(0, left):max(0, left) + planes.shape[2]]
+        # Under what is drawn: each plane adds the layer where the drawing leaves the page uncovered, in place and a
+        # plane per thread, as the layer can cover most of the page
+        rest = 1 - sub[3]
+        def add(c):
+            sub[c] += planes[c] * rest
+        with ThreadPoolExecutor(4) as pool:
+            list(pool.map(add, range(4)))
     return img.rgb(background)
