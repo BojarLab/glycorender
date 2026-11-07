@@ -717,3 +717,53 @@ def test_a_page_of_millions_of_pixels_converts_in_parts_alike():
         parts = raster.render(c.ops, 300, 300, 4.0, 4.0, background)
         with patch.object(raster, 'THREADS', 1):
             assert np.array_equal(parts, raster.render(c.ops, 300, 300, 4.0, 4.0, background))
+
+
+def _strokes_page(size, together, path, widths, alphas, dash = None, clip = None):
+    """A path stroked at several widths, as one strokes op or as a stroke per width, rendered at 2x on white."""
+    c = pdfwrite.Canvas(BytesIO(), pagesize = (size, size))
+    c.setStrokeColorRGB(0.2, 0.5, 0.7)
+    c.setLineCap(1)
+    c.setLineJoin(1)
+    c.setDash(dash)
+    c.state['clip'] = clip
+    p = c.beginPath()
+    p.moveTo(*path[0])
+    for x, y in path[1:]:
+        p.lineTo(x, y)
+    if together:
+        c.drawStrokes(p, widths, alphas)
+    else:
+        for w, a in zip(widths, alphas):
+            c.setLineWidth(w)
+            c.setStrokeColorRGB(0.2, 0.5, 0.7, alpha = a)
+            c.drawPath(p, fill = 0, stroke = 1)
+    return c.ops, raster.render(c.ops, size, size, 2.0, 2.0, (1.0, 1.0, 1.0))
+
+
+@pytest.mark.parametrize('size, dash', [(400, None), (400, (6, 3)), (40, None)])
+def test_strokes_blend_once_as_strokes_painted_in_turn(size, dash):
+    # A glow's strokes of one color over each other: over a large page as covered pixels, dashed through the stroke
+    # pieces, and over a small box as a whole array
+    wave = [(size * (0.05 + 0.9 * i / 39), size * (0.5 + 0.35 * math.sin(i / 4))) for i in range(40)]
+    widths, alphas = [8.4, 5.4, 3.2, 2.0], [0.06, 0.1, 0.2, 1.0]
+    ops, together = _strokes_page(size, True, wave, widths, alphas, dash)
+    assert [op['kind'] for op in ops] == ['strokes']
+    _, apart = _strokes_page(size, False, wave, widths, alphas, dash)
+    assert np.abs(together.astype(int) - apart.astype(int)).max() <= 1 and (together < 250).sum() > 1000
+
+
+def test_strokes_that_cover_most_of_their_box_or_nothing():
+    # One thick segment fills most of its box, which blends as one slice; it strokes into a capsule
+    seg = [(2.0, 10.0), (18.0, 10.0)]
+    _, together = _strokes_page(20, True, seg, [16.0, 10.0], [0.3, 1.0])
+    _, apart = _strokes_page(20, False, seg, [16.0, 10.0], [0.3, 1.0])
+    assert np.abs(together.astype(int) - apart.astype(int)).max() <= 1 and (together < 250).mean() > 0.5
+    blank = np.full((40, 40, 3), 255, np.uint8)
+    # No alpha, a clip that leaves nothing, a hairline between sub-scanlines, and an empty path draw nothing
+    away = [((30, 30, 5, 5), (1, 0, 0, 1, 0, 0))]
+    for widths, alphas, clip in (([4.0], [0.0], None), ([4.0], [1.0], away), ([0.01], [1.0], None)):
+        assert np.array_equal(_strokes_page(20, True, seg, widths, alphas, clip = clip)[1], blank)
+    c = pdfwrite.Canvas(BytesIO(), pagesize = (20, 20))
+    c.drawStrokes(c.beginPath(), [1.0], [1.0])
+    assert c.ops == []

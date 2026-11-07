@@ -475,8 +475,8 @@ class Image:
         instead of across four channels."""
         self.w, self.h = w, h
         self.buf = np.zeros((4, h, w), dtype = np.float32)
-    def paint(self, edges, rgb, alpha, even_odd = False, box = None, simple = False):
-        if not len(edges) or alpha <= 0: return
+    def _span(self, edges, box):
+        """The pixels (x0, y0, x1, y1) that edges reach within a clip box, or None for none."""
         lo = box[:2] if box else (-1e9, -1e9)
         hi = box[2:] if box else (1e9, 1e9)
         xe, ye = edges[:, 0::2], edges[:, 1::2]
@@ -484,24 +484,19 @@ class Image:
         x1 = min(self.w, int(math.ceil(min(xe.max(), hi[0]))) + 1)
         y0 = max(0, int(math.floor(max(ye.min(), lo[1]))))
         y1 = min(self.h, int(math.ceil(min(ye.max(), hi[1]))) + 1)
-        if x1 <= x0 or y1 <= y0: return
-        a = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd, simple, True)
+        return None if x1 <= x0 or y1 <= y0 else (x0, y0, x1, y1)
+    def _blend(self, rgb, x0, y0, a):
+        """A color over the image at coverage `a`: float32 values over the box from (x0, y0), or the (rows, columns,
+        values) of its covered pixels."""
         col = np.append(np.asarray(rgb, dtype = np.float32), np.float32(1.0))
         if isinstance(a, tuple):
-            # Thin ink over a large box comes as its covered pixels alone
             ys, xs, v = a
-            v = v.astype(np.float32)
-            if alpha != 1:
-                v *= alpha
         else:
-            a = a.astype(np.float32)
-            if alpha != 1:
-                a *= alpha
             covered = np.count_nonzero(a)
             if not covered: return
             # A mostly covered box (a figure or axes background, a square symbol) blends fastest as one slice
             if 2 * covered > a.size:
-                sub = self.buf[:, y0:y1, x0:x1]
+                sub = self.buf[:, y0:y0 + a.shape[0], x0:x0 + a.shape[1]]
                 sub *= 1 - a
                 sub += col[:, None, None] * a
                 return
@@ -515,6 +510,47 @@ class Image:
         sub *= 1 - v
         sub += col[:, None] * v
         flat[:, idx] = sub
+    def paint(self, edges, rgb, alpha, even_odd = False, box = None, simple = False):
+        if not len(edges) or alpha <= 0: return
+        span = self._span(edges, box)
+        if span is None: return
+        x0, y0, x1, y1 = span
+        a = coverage(edges, x0, y0, x1 - x0, y1 - y0, even_odd, simple, True)
+        if isinstance(a, tuple):
+            # Thin ink over a large box comes as its covered pixels alone
+            ys, xs, v = a
+            v = v.astype(np.float32)
+            if alpha != 1:
+                v *= alpha
+            self._blend(rgb, x0, y0, (ys, xs, v))
+        else:
+            a = a.astype(np.float32)
+            if alpha != 1:
+                a *= alpha
+            self._blend(rgb, x0, y0, a)
+    def paint_strokes(self, layers, rgb, box = None):
+        """Strokes of one color over each other, as (edges, simple, alpha) from the bottom up, blended once: coverages
+        a_i of one color leave 1 - (1 - a_1)(1 - a_2)... of it over what lies below, as painting them in turn does."""
+        layers = [v for v in layers if len(v[0]) and v[2] > 0]
+        span = self._span(np.vstack([v[0] for v in layers]), box) if layers else None
+        if span is None: return
+        x0, y0, x1, y1 = span
+        w, h = x1 - x0, y1 - y0
+        # What each pixel leaves of the image below it, multiplied by each stroke in turn
+        rest = np.ones(h * w, dtype = np.float32)
+        # The coverages on threads of their own, as much of each runs on one
+        with ThreadPoolExecutor(len(layers)) as pool:
+            found = list(pool.map(lambda v: coverage(v[0], x0, y0, w, h, False, v[1], True), layers))
+        for a, (_, _, alpha) in zip(found, layers):
+            if isinstance(a, tuple):
+                rest[a[0] * w + a[1]] *= 1 - a[2].astype(np.float32) * np.float32(alpha)
+            else:
+                rest *= 1 - a.ravel().astype(np.float32) * np.float32(alpha)
+        idx = np.flatnonzero(rest < 1)
+        if 2 * len(idx) > rest.size:
+            self._blend(rgb, x0, y0, (1 - rest).reshape(h, w))
+        elif len(idx):
+            self._blend(rgb, x0, y0, (idx // w, idx % w, 1 - rest[idx]))
     def paint_grad(self, edges, grad, ctm, alpha, even_odd = False, box = None, simple = False):
         """Fill `edges` with a radial gradient evaluated per pixel in the op's user space."""
         inv = _inv(ctm)
@@ -776,6 +812,18 @@ def shadow_alpha(ops, width, height, shadow, sticker = None, dpi = 150.0):
     return w, h, rows.tobytes()
 
 
+def _stroke(subs, op, ctm, width):
+    """The edges of a path's stroke at a width in user units, with the op's caps, joins, and dashes, and whether they
+    are a convex outline or a segment, whose winding is only ever 0 or 1."""
+    sc = math.sqrt(abs(ctm[0] * ctm[3] - ctm[1] * ctm[2])) or 1.0
+    dash = [v * sc for v in op['dash'][0]] if op['dash'] and op['dash'][0] else None
+    edges = None if dash else _outline(subs, max(width * sc, 0.1) / 2.0, op['cap'], op['join'])
+    if edges is not None:
+        return edges, True
+    return _edges(stroke_polys(subs, width * sc, op['cap'], op['join'], dash, (op['dash'][1] if op['dash'] else 0.0)
+                               * sc), True), False
+
+
 def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, shadow = None, sticker = None,
            under = None):
     """Rasterize a pdfwrite display list; `background` None keeps alpha. PDF y-up is flipped to image y-down here.
@@ -820,14 +868,13 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
             elif op['fill']:
                 img.paint(_edges(subs, True), op['fill_rgb'], op['fill_alpha'], op.get('even_odd', False), box, simple)
             if op['stroke']:
-                sc = math.sqrt(abs(ctm[0] * ctm[3] - ctm[1] * ctm[2])) or 1.0
-                dash = [v * sc for v in op['dash'][0]] if op['dash'] and op['dash'][0] else None
-                edges = None if dash else _outline(subs, max(op['line_width'] * sc, 0.1) / 2.0, op['cap'], op['join'])
-                fast = edges is not None
-                if not fast:
-                    edges = _edges(stroke_polys(subs, op['line_width'] * sc, op['cap'], op['join'], dash,
-                                                (op['dash'][1] if op['dash'] else 0.0) * sc), True)
-                img.paint(edges, op['stroke_rgb'], op['stroke_alpha'], False, box, fast)
+                edges, simple = _stroke(subs, op, ctm, op['line_width'])
+                img.paint(edges, op['stroke_rgb'], op['stroke_alpha'], False, box, simple)
+        elif op['kind'] == 'strokes':
+            subs = flatten(op['path'], ctm)
+            if subs:
+                img.paint_strokes([_stroke(subs, op, ctm, v) + (a, ) for v, a in zip(op['widths'], op['alphas'])],
+                                  op['stroke_rgb'], box)
         elif op['kind'] == 'image':
             # Nearest-neighbor lookup of each device pixel center in the unit square the image is drawn onto
             inv, corners = _inv(ctm), [_apply(ctm, u, v) for u in (0, 1) for v in (0, 1)]

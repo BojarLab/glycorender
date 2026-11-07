@@ -303,6 +303,15 @@ class Canvas:
         op.update(kind='markers', path=list(path.ops), xs=xs, ys=ys, fill=bool(fill), stroke=bool(stroke))
         self.ops.append(op)
 
+    def drawStrokes(self, path, widths, alphas):
+        """One path stroked in the current stroke color at each width with its alpha, from the bottom up, as a glow
+        around a line. For raster output only, which blends them once: to_pdf and to_svg do not take this op."""
+        if not path.ops: return
+        op = dict(self.state)
+        op.update(kind='strokes', path=list(path.ops), widths=list(widths), alphas=list(alphas), fill=False,
+                  stroke=True)
+        self.ops.append(op)
+
     def drawImage(self, png):
         """PNG bytes onto the unit square of the current user space, first row at the top, as PDF images go.
 
