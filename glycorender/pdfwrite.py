@@ -1,5 +1,6 @@
 """Minimal PDF canvas: the subset of the reportlab API that render.py actually uses, stdlib only."""
 import os, zlib, math, struct
+from functools import lru_cache
 from io import BytesIO
 import numpy as np
 from .ttf import TTF, subset
@@ -42,7 +43,7 @@ def norm_stops(stops):
 
 
 def _stop_function(out, stops, channels):
-    """PDF function interpolating the given colour channels of `stops` across [0, 1]."""
+    """PDF function interpolating the given color channels of `stops` across [0, 1]."""
     vals = ['%s' % ' '.join(_fmt(c[i]) for i in channels) for _, c in stops]
     if len(stops) < 2:
         return out.add(('<< /FunctionType 2 /Domain [0 1] /C0 [%s] /C1 [%s] /N 1 >>' % (vals[0], vals[0])).encode())
@@ -73,6 +74,19 @@ def _kerned_run(ttf, text):
     return '[%s]' % ' '.join(parts)
 
 
+def _symbol_unit(ops):
+    """The median size of the filled and stroked shapes, the symbols of a drawing, which the effects scale with."""
+    sizes = []
+    for op in ops:
+        if op['kind'] != 'path' or not (op['fill'] and op['stroke']):
+            continue
+        xs = [seg[i] for seg in op['path'] for i in range(1, len(seg), 2)]
+        ys = [seg[i] for seg in op['path'] for i in range(2, len(seg), 2)]
+        if xs:
+            sizes.append(max(max(xs) - min(xs), max(ys) - min(ys)))
+    return sorted(sizes)[len(sizes) // 2] if sizes else 50.0
+
+
 def shadow_params(ops, shadow):
     """Turn `shadow=True` into a spec, scaling offset and blur to the typical symbol size.
 
@@ -82,15 +96,7 @@ def shadow_params(ops, shadow):
     if not shadow:
         return None
     spec = dict(shadow) if isinstance(shadow, dict) else {}
-    sizes = []
-    for op in ops:
-        if op['kind'] != 'path' or not (op['fill'] and op['stroke']):
-            continue
-        xs = [seg[i] for seg in op['path'] for i in range(1, len(seg), 2)]
-        ys = [seg[i] for seg in op['path'] for i in range(2, len(seg), 2)]
-        if xs:
-            sizes.append(max(max(xs) - min(xs), max(ys) - min(ys)))
-    unit = sorted(sizes)[len(sizes) // 2] if sizes else 50.0
+    unit = _symbol_unit(ops)
     spec.setdefault('dx', 0.03 * unit)
     spec.setdefault('dy', 0.05 * unit)
     spec.setdefault('blur', 0.07 * unit)
@@ -108,15 +114,7 @@ def sticker_params(ops, sticker):
     if not sticker:
         return None
     spec = dict(sticker) if isinstance(sticker, dict) else {}
-    sizes = []
-    for op in ops:
-        if op['kind'] != 'path' or not (op['fill'] and op['stroke']):
-            continue
-        xs = [seg[i] for seg in op['path'] for i in range(1, len(seg), 2)]
-        ys = [seg[i] for seg in op['path'] for i in range(2, len(seg), 2)]
-        if xs:
-            sizes.append(max(max(xs) - min(xs), max(ys) - min(ys)))
-    unit = sorted(sizes)[len(sizes) // 2] if sizes else 50.0
+    unit = _symbol_unit(ops)
     spec.setdefault('width', 0.18 * unit)
     spec.setdefault('color', (1.0, 1.0, 1.0))
     spec.setdefault('edge', 0.0)
@@ -157,8 +155,22 @@ class _Registry:
 
 
 _FONT_DIRS = [os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'Fonts'),
+              os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~/AppData/Local')), 'Microsoft',
+                           'Windows', 'Fonts'),
               '/Library/Fonts', '/System/Library/Fonts', os.path.expanduser('~/Library/Fonts'),
-              '/usr/share/fonts', '/usr/local/share/fonts', os.path.expanduser('~/.fonts')]
+              '/usr/share/fonts', '/usr/local/share/fonts', os.path.expanduser('~/.fonts'),
+              os.path.expanduser('~/.local/share/fonts')]
+
+
+@lru_cache(maxsize = None)
+def _installed_fonts():
+    """Every font file of the platform's font directories by lowercase name, walked once for all the names tried."""
+    found = {}
+    for root in _FONT_DIRS:
+        for base, _, files in os.walk(root):
+            for name in files:
+                found.setdefault(name.lower(), os.path.join(base, name))
+    return found
 
 
 class TTFont:
@@ -166,15 +178,8 @@ class TTFont:
         """Font class."""
         self.name = name
         if not os.path.isfile(filename):  # bare filename: search the platform font directories, as reportlab does
-            for root in _FONT_DIRS:
-                for base, _, files in os.walk(root) if os.path.isdir(root) else ():
-                    hit = {f.lower(): f for f in files}.get(filename.lower())
-                    if hit:
-                        filename = os.path.join(base, hit)
-                        break
-                if os.path.isfile(filename):
-                    break
-            else:
+            filename = _installed_fonts().get(filename.lower()) or filename
+            if not os.path.isfile(filename):
                 raise FileNotFoundError(filename)
         self.ttf = TTF(filename)
 
@@ -197,6 +202,25 @@ class Path:
 
 
 _PDF_OP = {'m': '%s %s m', 'l': '%s %s l', 'c': '%s %s %s %s %s %s c', 'h': 'h'}
+
+
+@lru_cache(maxsize = 64)
+def _font_streams(ttf, kept):
+    """A font's subset and ToUnicode map for a glyph set, deflated, and the length of the raw subset. Drawings keep
+    using the same few glyph sets, and these streams were a third of the time a small PDF took."""
+    raw = subset(ttf, kept)
+    # Map only the glyphs the page uses; the whole cmap made up ~40% of a typical GlycoDraw PDF
+    used = set(kept)
+    pairs = sorted((g, ch) for ch, g in ttf.cmap.items() if g in used)
+    cmap = ('/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /A def /CMapType 2 def\n'
+            '1 begincodespacerange <0000> <FFFF> endcodespacerange\n')
+    for i in range(0, len(pairs), 100):
+        chunk = pairs[i:i+100]
+        cmap += '%d beginbfchar\n' % len(chunk)
+        cmap += ''.join('<%04X> <%s>\n' % (g, ''.join('%04X' % s for s in _utf16(ch))) for g, ch in chunk)
+        cmap += 'endbfchar\n'
+    cmap += 'endcmap CMapName currentdict /CMap defineresource pop end end'
+    return zlib.compress(raw, 9), len(raw), zlib.compress(cmap.encode('latin-1'), 9)
 
 
 class Canvas:
@@ -458,7 +482,9 @@ class Canvas:
         layers = [(spec['width'] + spec['edge'], spec['edge_color'])] if spec['edge'] > 0 else []
         for grow, color in layers + [(spec['width'], spec['color'])]:
             for op in self.ops:
-                if op['kind'] == 'path' and not (op['fill'] or op['stroke']): continue
+                # Text and shapes have a silhouette to cut around; an image or a form of markers has none of its own
+                if op['kind'] not in ('path', 'text') or op['kind'] == 'path' and not (op['fill'] or op['stroke']):
+                    continue
                 buf.append('q')
                 cur = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
                 for box, ctm in op.get('clip') or ():
@@ -504,17 +530,17 @@ class Canvas:
             stype, coords = 2, '[%s %s %s %s]' % tuple(_fmt(v) for v in geo)
         sh = out.add(('<< /ShadingType %d /ColorSpace /DeviceRGB /Coords %s /Function %d 0 R /Extend [true true] >>'
                       % (stype, coords, _stop_function(out, stops, (0, 1, 2)))).encode())
+        # The op's alpha goes into the mask, not next to it as /ca, which MuPDF applies inside the mask as well as out
         alpha_sh = out.add(
             ('<< /ShadingType %d /ColorSpace /DeviceGray /Coords %s /Function %d 0 R /Extend [true true] >>'
-             % (stype, coords, _stop_function(out, stops, (3,)))).encode())
+             % (stype, coords, _stop_function(out, [(o, (c[3] * alpha,) * 4) for o, c in stops], (3,)))).encode())
         body = b'/S0 sh'
         form = out.add(('<< /Type /XObject /Subtype /Form /BBox [%s %s %s %s] '
                         '/Group << /Type /Group /S /Transparency /CS /DeviceGray >> '
                         '/Resources << /Shading << /S0 %d 0 R >> >> /Length %d >>\nstream\n'
                         % (_fmt(bbox[0]), _fmt(bbox[1]), _fmt(bbox[2]), _fmt(bbox[3]), alpha_sh, len(body))).encode()
                        + body + b'\nendstream')
-        return sh, ('<< /Type /ExtGState /SMask << /S /Luminosity /G %d 0 R /BC [0] >> /ca %s /CA %s >>'
-                    % (form, _fmt(alpha), _fmt(alpha)))
+        return sh, '<< /Type /ExtGState /SMask << /S /Luminosity /G %d 0 R /BC [0] >> /ca 1 /CA 1 >>' % form
     def _font_objects(self, out, name, font):
         ttf = font.ttf
         scale = 1000.0 / ttf.units_per_em
@@ -523,9 +549,8 @@ class Canvas:
         # is derived from the glyph set, so the output stays reproducible and different subsets never share a name
         crc = zlib.crc32(str(kept).encode())
         base = ''.join(chr(65 + crc // 26 ** i % 26) for i in range(6)) + '+' + name
-        raw = subset(ttf, self.glyphs.get(name, set()))
-        packed = zlib.compress(raw, 9)
-        file_ref = out.add(b'<< /Length %d /Length1 %d /Filter /FlateDecode >>\nstream\n' % (len(packed), len(raw))
+        packed, raw_length, packed_cmap = _font_streams(ttf, tuple(kept))
+        file_ref = out.add(b'<< /Length %d /Length1 %d /Filter /FlateDecode >>\nstream\n' % (len(packed), raw_length)
                            + packed + b'\nendstream')
         flags = 4 | (1 if ttf.mac_style & 2 else 0) << 6
         desc = out.add(('<< /Type /FontDescriptor /FontName /%s /Flags %d /FontBBox [%d %d %d %d] '
@@ -537,18 +562,6 @@ class Canvas:
         cid = out.add(('<< /Type /Font /Subtype /CIDFontType2 /BaseFont /%s /CIDSystemInfo '
                        '<< /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor %d 0 R '
                        '/DW 1000 /W %s /CIDToGIDMap /Identity >>' % (base, desc, widths)).encode())
-        # Map only the glyphs the page uses; the whole cmap made up ~40% of a typical GlycoDraw PDF
-        used = set(kept)
-        pairs = sorted((g, ch) for ch, g in ttf.cmap.items() if g in used)
-        cmap = ('/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /A def /CMapType 2 def\n'
-                '1 begincodespacerange <0000> <FFFF> endcodespacerange\n')
-        for i in range(0, len(pairs), 100):
-            chunk = pairs[i:i+100]
-            cmap += '%d beginbfchar\n' % len(chunk)
-            cmap += ''.join('<%04X> <%s>\n' % (g, ''.join('%04X' % s for s in _utf16(ch))) for g, ch in chunk)
-            cmap += 'endbfchar\n'
-        cmap += 'endcmap CMapName currentdict /CMap defineresource pop end end'
-        packed_cmap = zlib.compress(cmap.encode('latin-1'), 9)
         tou = out.add(b'<< /Length %d /Filter /FlateDecode >>\nstream\n' % len(packed_cmap) + packed_cmap + b'\nendstream')
         return out.add(('<< /Type /Font /Subtype /Type0 /BaseFont /%s /Encoding /Identity-H '
                         '/DescendantFonts [%d 0 R] /ToUnicode %d 0 R >>' % (base, cid, tou)).encode())
@@ -604,8 +617,13 @@ class Canvas:
         res = '<< /Font << %s >> /ExtGState << %s >> /Shading << %s >> /XObject << %s >> >>' % (
             fonts, ' '.join(gs), ' '.join(sh), xobj)
         pages_ref = out.reserve()
-        page = out.add(('<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %s %s] /Resources %s /Contents %d 0 R >>'
-                        % (pages_ref, _fmt(self.width), _fmt(self.height), res, stream)).encode())
+        # Transparent content on a page of its own color space, as matplotlib does, or a reader may blend it in another
+        # one, such as Acrobat's working CMYK, and shift its colors
+        clear = (shadow or shadings or any(k[0] < 1 for k in alphas) or
+                 any(op['alpha'] is not None and op['alpha'].count(255) < len(op['alpha']) for op in images))
+        group = ' /Group << /Type /Group /S /Transparency /CS /DeviceRGB >>' if clear else ''
+        page = out.add(('<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %s %s] /Resources %s /Contents %d 0 R%s >>'
+                        % (pages_ref, _fmt(self.width), _fmt(self.height), res, stream, group)).encode())
         out.set(pages_ref, ('<< /Type /Pages /Kids [%d 0 R] /Count 1 >>' % page).encode())
         root = out.add(('<< /Type /Catalog /Pages %d 0 R >>' % pages_ref).encode())
         info = None

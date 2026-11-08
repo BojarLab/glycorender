@@ -272,7 +272,7 @@ def _contour_to_cmds(pts):
     """TrueType quadratic contour (with implied on-curve midpoints) -> M/L/Q/Z commands."""
     if not pts:
         return []
-    if not pts[0][2]:  # contour starts off-curve: rotate to an on-curve point or synthesise one
+    if not pts[0][2]:  # contour starts off-curve: rotate to an on-curve point or synthesize one
         on = next((i for i, p in enumerate(pts) if p[2]), None)
         if on is None:
             mx, my = (pts[0][0] + pts[-1][0]) / 2.0, (pts[0][1] + pts[-1][1]) / 2.0

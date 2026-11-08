@@ -40,7 +40,7 @@ def _inv(m):
 
 
 def sample_stops(stops, t):
-    """Interpolate normalised gradient stops at t, clamping outside [first, last]."""
+    """Interpolate normalized gradient stops at t, clamping outside [first, last]."""
     xs = [o for o, _ in stops]
     return [np.interp(t, xs, [c[ch] for _, c in stops]) for ch in range(4)]
 
@@ -70,7 +70,8 @@ def flatten(ops, ctm):
             ys = b0*p0[1] + b1*p1[1] + b2*p2[1] + b3*p3[1]
             cur.extend(zip(xs.tolist(), ys.tolist()))
         elif k == 'h':
-            if cur and start and cur[-1] != start: cur.append(start)
+            # A subpath of one point stays, as a stroke gives it a cap
+            if cur and start and (cur[-1] != start or len(cur) == 1): cur.append(start)
     if len(cur) > 1: subs.append(cur)
     return subs
 
@@ -360,7 +361,12 @@ def stroke_polys(subs, width, cap, join, dash = None, phase = 0.0):
     for pts in subs:
         pts = [p for i, p in enumerate(pts) if i == 0 or p != pts[i - 1]]
         if len(pts) < 2:
+            # Zero length draws nothing with a butt cap, a dot with a round one, and a square along the axes with a
+            # square one
             if pts and cap == 1: polys.append(_arc(pts[0][0], pts[0][1], hw))
+            if pts and cap == 2:
+                x, y = pts[0]
+                polys.append([(x - hw, y - hw), (x + hw, y - hw), (x + hw, y + hw), (x - hw, y + hw)])
             continue
         for run in (_dash(pts, dash, phase) if dash else [pts]):
             run = [p for i, p in enumerate(run) if i == 0 or p != run[i - 1]]
@@ -435,6 +441,18 @@ def _clip_box(clips, flip):
         cur = (min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts))
         box = cur if box is None else (max(box[0], cur[0]), max(box[1], cur[1]), min(box[2], cur[2]), min(box[3], cur[3]))
     return box
+
+
+def _clip_mask(clips, flip, w, h):
+    """Coverage of the clip rects that are not axis-aligned, which their bounding box leaves to this; None for none."""
+    mask = None
+    for (x, y, cw, ch), ctm in clips or ():
+        m = _mul(ctm, flip)
+        if (abs(m[1]) < 1e-9 and abs(m[2]) < 1e-9) or (abs(m[0]) < 1e-9 and abs(m[3]) < 1e-9): continue
+        cov = coverage(_loops(np.array([_apply(m, x, y), _apply(m, x + cw, y), _apply(m, x + cw, y + ch),
+                                        _apply(m, x, y + ch)])), 0, 0, w, h, simple = True).astype(np.float32)
+        mask = cov if mask is None else mask * cov
+    return mask
 
 
 def _glyph_paths(op, ctm):
@@ -602,7 +620,7 @@ class Image:
                 out[idx] = np.clip(v, 0, 255, out = v).astype(np.uint8)
             _in_parts(straight, np.flatnonzero(flat[3] > 1e-6))
             return out.reshape(self.h, self.w, 4)
-        # Untouched pixels hold zero colour and zero alpha, so they come out as the background colour itself
+        # Untouched pixels hold zero color and zero alpha, so they come out as the background color itself
         bg = np.asarray(background, dtype = np.float64)
         # Filled a whole row at a time, as broadcasting three bytes per pixel is several times slower
         out = np.empty((self.h, self.w * 3), dtype = np.uint8)
@@ -789,7 +807,7 @@ def _ink_mask(ops, w, h, flip, dx = 0.0, dy = 0.0, grow = 0.0, symbols_only = Tr
             if op['fill']:
                 add(_edges(subs, True), op.get('even_odd', False), len(subs) == 1 and _convex(subs[0]) is not None)
             if width > 0: add(_edges(stroke_polys(subs, width, cap, join), True))
-        elif not symbols_only:
+        elif not symbols_only and op['kind'] == 'text':
             subs = []
             for cmds, gctm in _glyph_paths(op, ctm):
                 subs.extend(flatten(cmds, gctm))
@@ -815,8 +833,17 @@ def shadow_alpha(ops, width, height, shadow, sticker = None, dpi = 150.0):
 def _stroke(subs, op, ctm, width):
     """The edges of a path's stroke at a width in user units, with the op's caps, joins, and dashes, and whether they
     are a convex outline or a segment, whose winding is only ever 0 or 1."""
-    sc = math.sqrt(abs(ctm[0] * ctm[3] - ctm[1] * ctm[2])) or 1.0
+    a, b, c, d, e, f = ctm
+    sc = math.sqrt(abs(a * d - b * c)) or 1.0
     dash = [v * sc for v in op['dash'][0]] if op['dash'] and op['dash'][0] else None
+    if abs(a * a + b * b - c * c - d * d) > 1e-6 * sc * sc or abs(a * c + b * d) > 1e-6 * sc * sc:
+        # A scale that differs by direction, or a skew, stretches the stroke with the shape, so it is stroked at the
+        # mean scale and its outline carried the rest of the way
+        seg = _edges(stroke_polys(flatten(op['path'], (sc, 0.0, 0.0, sc, 0.0, 0.0)), width * sc, op['cap'], op['join'],
+                                  dash, (op['dash'][1] if op['dash'] else 0.0) * sc), True) / sc
+        seg = np.column_stack([a * seg[:, 0] + c * seg[:, 1] + e, b * seg[:, 0] + d * seg[:, 1] + f,
+                               a * seg[:, 2] + c * seg[:, 3] + e, b * seg[:, 2] + d * seg[:, 3] + f])
+        return seg[seg[:, 1] != seg[:, 3]], False
     edges = None if dash else _outline(subs, max(width * sc, 0.1) / 2.0, op['cap'], op['join'])
     if edges is not None:
         return edges, True
@@ -853,7 +880,15 @@ def render(ops, width, height, scale_x = 1.0, scale_y = 1.0, background = None, 
         for c, v in enumerate(tuple(color) + (1.0,)):
             img.buf[c] *= rest
             img.buf[c] += a * v
-    for op in ops:
+    def in_turn():
+        # Each op, and after one under a clip that is not axis-aligned, what that clip keeps out put back as it was
+        for op in ops:
+            mask = _clip_mask(op.get('clip'), flip, w, h)
+            before = None if mask is None else img.buf.copy()
+            yield op
+            if mask is not None:
+                img.buf += (before - img.buf) * (1 - mask)
+    for op in in_turn():
         ctm = _mul(op['ctm'], flip)
         if _inv(ctm) is None: continue
         box = _clip_box(op.get('clip'), flip)

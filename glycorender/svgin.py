@@ -21,7 +21,7 @@ _NAMED = {'none': None, 'black': (0, 0, 0), 'white': (1, 1, 1), 'red': (1, 0, 0)
           'olive': (.5, .5, 0), 'maroon': (.5, 0, 0), 'darkblue': (0, 0, .545), 'skyblue': (.529, .808, .922)}
 _INHERIT = ('fill', 'stroke', 'stroke-width', 'opacity', 'fill-opacity', 'stroke-opacity', 'fill-rule',
             'stroke-linecap', 'stroke-linejoin', 'stroke-dasharray', 'stroke-dashoffset',
-            'font-size', 'font-weight', 'text-anchor')
+            'font-size', 'font-weight', 'font-style', 'text-anchor')
 _CAP = {'butt': 0, 'round': 1, 'square': 2}
 _JOIN = {'miter': 0, 'round': 1, 'bevel': 2}
 
@@ -72,14 +72,28 @@ def _color(text):
     return None
 
 
+def _declare(out, declarations):
+    """CSS declarations into a style, with the `font` shorthand of older matplotlib (`bold 12px 'DejaVu Sans'`)."""
+    for item in declarations.split(';'):
+        if ':' in item:
+            k, v = (part.strip() for part in item.split(':', 1))
+            if k in _INHERIT: out[k] = v
+            size = re.search(r'([\d.]+)px', v) if k == 'font' else None
+            if size:
+                out['font-size'] = size.group(1)
+                head = v[:size.start()]
+                if 'bold' in head: out['font-weight'] = 'bold'
+                if 'italic' in head or 'oblique' in head: out['font-style'] = 'italic'
+
+
 def _style(el, parent):
-    out = dict(parent)
+    # Opacity alone does not inherit: an element multiplies its group's
+    out = {k: v for k, v in parent.items() if k != 'opacity'}
     for k, v in el.attrib.items():
         if k in _INHERIT: out[k] = v
-    for item in el.get('style', '').split(';'):
-        if ':' in item:
-            k, v = item.split(':', 1)
-            if k.strip() in _INHERIT: out[k.strip()] = v.strip()
+    _declare(out, el.get('style', ''))
+    if 'opacity' in parent:
+        out['opacity'] = _num(parent['opacity']) * _num(out.get('opacity'), 1.0)
     return out
 
 
@@ -175,7 +189,7 @@ def parse_path(d):
 
 
 def _arc_to_curves(x1, y1, rx, ry, phi, large, sweep, x2, y2):
-    """Endpoint-parameterised elliptical arc -> cubic segments (SVG implementation notes F.6)."""
+    """Endpoint-parameterized elliptical arc -> cubic segments (SVG implementation notes F.6)."""
     if rx == 0 or ry == 0 or (x1 == x2 and y1 == y2): return [('l', x2, y2)]
     rx, ry = abs(rx), abs(ry)
     r = math.radians(phi)
@@ -332,7 +346,7 @@ class _Renderer:
             self.c.setFillColorRGB(0, 0, 0, alpha = _num(style.get('opacity'), 1.0))
             self.c.drawImage(base64.b64decode(re.sub(r'\s+', '', m.group(1))))
             self.c.restoreState()
-        elif tag in ('text', 'tspan'):
+        elif tag == 'text':
             self._text(el, style, ctm, clip, depth)
 
     def _clip(self, el, ctm, clip):
@@ -355,26 +369,59 @@ class _Renderer:
         if not box: return clip
         return (clip or []) + [(box, inner)]
 
+    def _face(self, style):
+        """(font, size) of a style."""
+        bold = str(style.get('font-weight', '')).strip() in ('bold', '700', '800', '900')
+        return self.font[1] if bold else self.font[0], _num(style.get('font-size'), 12.0)
+
     def _text(self, el, style, ctm, clip, depth):
-        size = _num(style.get('font-size'), 12.0)
-        name = self.font[1] if str(style.get('font-weight', '')).strip() in ('bold', '700', '800', '900') else self.font[0]
-        text = (el.text or '').strip()
-        if text:
-            x, y = _num(el.get('x')), _num(el.get('y'))
-            anchor = str(style.get('text-anchor', 'start')).strip()
-            if anchor in ('middle', 'end'):
-                w = pdfmetrics.stringWidth(text, name, size)
-                x -= w / 2.0 if anchor == 'middle' else w
+        # Runs of text in document order, each with its style and the position attributes met since the one before; a
+        # tspan continues where the text before it ended unless it says otherwise
+        runs, place = [], {}
+        def add(raw, st):
+            text = re.sub(r'\s+', ' ', raw)
+            if text.strip() or (runs and '\n' not in raw):
+                runs.append([text, st, dict(place)])
+                place.clear()
+        def visit(node, st):
+            place.update((k, node.get(k)) for k in ('x', 'y', 'dx', 'dy') if node.get(k) is not None)
+            if node.text: add(node.text, st)
+            for child in node:
+                if _tag(child) == 'tspan':
+                    visit(child, _style(child, st))
+                else:
+                    self.walk(child, st, ctm, clip, depth + 1)
+                if child.tail: add(child.tail, st)
+        visit(el, style)
+        if runs:
+            runs[0][0] = runs[0][0].lstrip()
+            runs[-1][0] = runs[-1][0].rstrip()
+        width = lambda run: pdfmetrics.stringWidth(run[0], *self._face(run[1]))
+        x = y = shift = 0.0
+        for i, run in enumerate(runs):
+            text, st, at = run
+            name, size = self._face(st)
+            x, y = _num(at.get('x'), x), _num(at.get('y'), y)
+            x += _num(at.get('dx')) * (size if 'em' in at.get('dx', '') else 1.0)
+            y += _num(at.get('dy')) * (size if 'em' in at.get('dy', '') else 1.0)
+            if i == 0 or 'x' in at:
+                # An anchor places all the runs up to the next absolute x as one
+                end = next((j for j in range(i + 1, len(runs)) if 'x' in runs[j][2]), len(runs))
+                anchor = str(st.get('text-anchor', 'start')).strip()
+                shift = sum(map(width, runs[i:end])) * {'middle': 0.5, 'end': 1.0}.get(anchor, 0.0)
             self.c.saveState()
-            self.c.state['ctm'] = _mul((1, 0, 0, -1, x, y), ctm)
+            place_at = (1, 0, 0, -1, x - shift, y)
+            # The bundled faces have no italic: lean the upright one, as render.py does for a furanose f
+            if str(st.get('font-style', '')).strip() in ('italic', 'oblique'):
+                place_at = _mul((1, 0, 0.3, 1, 0, 0), place_at)
+            self.c.state['ctm'] = _mul(place_at, ctm)
             self.c.state['clip'] = clip
-            fill = _color(style.get('fill', 'black')) or (0, 0, 0)
-            self.c.setFillColorRGB(*fill, alpha=_num(style.get('fill-opacity'), 1.0) * _num(style.get('opacity'), 1.0))
+            fill = _color(st.get('fill', 'black')) or (0, 0, 0)
+            self.c.setFillColorRGB(*fill, alpha=_num(st.get('fill-opacity'), 1.0) * _num(st.get('opacity'), 1.0))
             self.c.setFont(name, size)
             self.c.drawString(0, 0, text)
             self.c.restoreState()
-        for child in el:
-            self.walk(child, style, ctm, clip, depth + 1)
+            x += width(run)
 
 
 def _ellipse(cx, cy, rx, ry):
@@ -406,6 +453,13 @@ def build(svg_data, target, font=('Comfortaa', 'Comfortaa-Bold')):
     r = _Renderer(c, font)
     r.collect(root)
     ctm = _mul(_viewbox(root, width, height), (1.0, 0.0, 0.0, -1.0, 0.0, height))
+    # matplotlib leaves its usual joins and caps to a stylesheet's universal rule (`*{stroke-linejoin: round}`) and
+    # writes only what differs on its elements, so without this rule every line of a figure has spikes at its peaks
+    base = {}
+    for node in root.iter():
+        if _tag(node) == 'style':
+            for rule in re.findall(r'(?:^|[\s}])\*\s*\{([^}]*)\}', node.text or ''):
+                _declare(base, rule)
     for child in root:
-        r.walk(child, {}, ctm, None, 1)
+        r.walk(child, base, ctm, None, 1)
     return c

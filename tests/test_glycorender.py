@@ -1,13 +1,15 @@
 """Tests for glycorender: the SVG subset GlycoDraw emits, and the PNG/PDF/SVG backends."""
-import base64, math, os, re, struct, zlib
+import base64, importlib.metadata, math, os, re, shutil, struct, zlib
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
 import numpy as np
 import pytest
-from glycorender import pdfwrite, raster, svgdraw, ttf
-from glycorender.render import (_render_svg_to_pdf_canvas, convert_svg_to_pdf, convert_svg_to_png, parse_color,
-                                parse_path, pdf_to_svg_bytes, simple_svg_to_pdf, simple_svg_to_png)
+import glycorender
+from glycorender import pdfwrite, raster, svgdraw, svgin, ttf
+from glycorender.pdfwrite import pdfmetrics
+from glycorender.render import (_render_svg_to_pdf_canvas, convert_svg_to_pdf, convert_svg_to_png, font_to_use,
+                                parse_color, parse_path, pdf_to_svg_bytes, simple_svg_to_pdf, simple_svg_to_png)
 
 SNFG_SVG = """<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
@@ -327,7 +329,7 @@ def test_draw_image_undoes_every_png_filter():
         # Five rows of noise, then ten of few levels, where Paeth's tie-breaking order decides
         src = np.vstack([rng.randint(0, 256, (5, 3 * bpp)), rng.randint(0, 4, (10, 3 * bpp)) * 85])
         rows, prev = [], np.zeros(3 * bpp, dtype = int)
-        # Row r uses filter r (None, Sub, Up, Average, Paeth, then Paeth), predicted from its unfiltered neighbours
+        # Row r uses filter r (None, Sub, Up, Average, Paeth, then Paeth), predicted from its unfiltered neighbors
         for r, row in enumerate(src):
             left = np.concatenate([np.zeros(bpp, dtype = int), row[:-bpp]])
             corner = np.concatenate([np.zeros(bpp, dtype = int), prev[:-bpp]])
@@ -767,3 +769,291 @@ def test_strokes_that_cover_most_of_their_box_or_nothing():
     c = pdfwrite.Canvas(BytesIO(), pagesize = (20, 20))
     c.drawStrokes(c.beginPath(), [1.0], [1.0])
     assert c.ops == []
+
+
+def _doc(body, size = 100):
+    return ('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="%d" height="%d" '
+            'viewBox="0 0 %d %d">%s</svg>' % (size, size, size, size, body))
+
+
+def _built(body):
+    return svgin.build(_doc(body), None, (font_to_use, font_to_use + '-Bold'))
+
+
+def _segments(op):
+    return [seg[0] for seg in op['path']]
+
+
+def test_rdkit_paths_are_drawn_as_they_stand():
+    style = ('fill:none;fill-rule:evenodd;stroke:#FF0000;stroke-width:2.0px;stroke-linecap:%s;stroke-linejoin:%s;'
+             'stroke-opacity:1')
+    # A ring joint is an open polyline, whose closing edge used to paint a lump onto the bond
+    joint = "<path d='M 10,10 L 50,10 L 50,50' style='%s' />" % (style % ('butt', 'miter'))
+    op = _render_svg_to_pdf_canvas(_doc(joint), None).ops[-1]
+    assert _segments(op) == ['m', 'l', 'l'] and (op['cap'], op['join']) == (0, 0) and op['line_width'] == 2.0
+    # A hatch of a wedge is one segment: butt, as RDKit says, not a retraced capsule
+    hatch = "<path d='M 10,10 L 50,10' style='%s' />" % (style % ('butt', 'miter'))
+    assert _segments(_render_svg_to_pdf_canvas(_doc(hatch), None).ops[-1]) == ['m', 'l']
+    # Only the line style named counts, and the other falls back to SVG's default
+    capped = "<path d='M 10,10 L 50,10' style='fill:none;stroke:#000000;stroke-linecap:round' />"
+    op = _render_svg_to_pdf_canvas(_doc(capped), None).ops[-1]
+    assert (op['cap'], op['join']) == (1, 0)
+    # GlycoDraw's elements have no style attribute and keep the closing rule
+    plain = '<path d="M 10,10 L 50,10 L 50,50" stroke="#000000" fill="none" />'
+    assert _segments(_render_svg_to_pdf_canvas(_doc(plain), None).ops[-1])[-1] == 'h'
+
+
+def test_a_path_nested_in_defs_is_not_drawn():
+    nested = ('<defs><g><path d="M0,0 L9,0 L9,9 Z" fill="#FF0000" id="p" /></g></defs>'
+              '<rect width="5" height="5" fill="#00FF00" />')
+    ops = _render_svg_to_pdf_canvas(_doc(nested), None).ops
+    assert len(ops) == 1 and ops[0]['fill_rgb'] == pytest.approx((0, 1, 0))
+
+
+@pytest.mark.parametrize('path, circle, end', [('M0,50 L80,50', 'cx="80" cy="50"', 55),
+                                               ('M0,50 L10,50', 'cx="10" cy="50"', 10),
+                                               ('M0,50 L80,50', 'cx="40" cy="50"', 80),
+                                               ('M0,50 H80', 'cx="80" cy="50"', 80)])
+def test_a_linkage_trims_at_an_invisible_circle(path, circle, end):
+    body = '<path d="%s" stroke-width="4.0" stroke="#000000" /><circle %s r="5" fill="none" />' % (path, circle)
+    op = next(o for o in _render_svg_to_pdf_canvas(_doc(body), None).ops if o['line_width'] == 4.0)
+    assert max(seg[1] for seg in op['path'] if len(seg) > 1) == pytest.approx(end)
+
+
+def test_a_one_command_path_stands_with_an_invisible_circle_around():
+    body = '<path d="M0,50" stroke-width="4.0" stroke="#000000" /><circle cx="0" cy="50" r="5" fill="none" />'
+    assert _render_svg_to_pdf_canvas(_doc(body), None).ops is not None
+
+
+def test_svgin_takes_matplotlibs_universal_rule():
+    rule = '<defs><style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style></defs>'
+    ops = _built(rule + '<path d="M0,0 L9,9 L0,9" fill="none" stroke="#000000" />'
+                 '<path d="M0,0 L9,9" fill="none" style="stroke: #000000; stroke-linejoin: miter" />').ops
+    assert ops[0]['join'] == 1 and ops[1]['join'] == 0
+
+
+def test_svgin_multiplies_opacity_down_a_group():
+    op = _built('<g opacity="0.5"><path d="M0,0 L9,9 L0,9 Z" opacity="0.5" /><path d="M0,0 L9,9 L0,9 Z" /></g>').ops
+    assert op[0]['fill_alpha'] == pytest.approx(0.25) and op[1]['fill_alpha'] == pytest.approx(0.5)
+
+
+def test_svgin_reads_the_font_shorthand():
+    op = _built("""<text x="5" y="5" style="font: italic bold 14.5px 'DejaVu Sans'">a</text>"""
+                """<text x="5" y="5" style="font: 8px 'DejaVu Sans'">a</text>"""
+                """<text x="5" y="5" style="font: oblique 9px 'Bold Face'">a</text>""").ops
+    assert op[0]['size'] == 14.5 and op[0]['font'].endswith('-Bold') and op[0]['ctm'][2] != 0
+    assert op[1]['size'] == 8 and not op[1]['font'].endswith('-Bold') and op[1]['ctm'][2] == 0
+    assert op[2]['size'] == 9 and not op[2]['font'].endswith('-Bold') and op[2]['ctm'][2] != 0
+
+
+def test_svgin_tspans_follow_the_text_before_them():
+    w = lambda text, size = 10: pdfmetrics.stringWidth(text, font_to_use, size)
+    # What as_standalone_svg writes for a furanose label: a tspan with no position continues the run, anchored as one
+    op = _built('<text x="50" y="20" font-size="10" text-anchor="middle">D<tspan font-style="italic">f</tspan></text>'
+                ).ops
+    x0 = 50 - (w('D') + w('f')) / 2
+    assert op[0]['ctm'][4] == pytest.approx(x0) and op[0]['ctm'][5] == pytest.approx(80) and op[0]['ctm'][2] == 0
+    assert op[1]['ctm'][4] == pytest.approx(x0 + w('D')) and op[1]['ctm'][5] == pytest.approx(80)
+    assert op[1]['ctm'][2] != 0
+    # A lone tspan takes its parent's position, and text after a tspan carries on from it
+    op = _built('<text x="10" y="20" font-size="10"><tspan>a</tspan>b</text>').ops
+    assert [o['text'] for o in op] == ['a', 'b']
+    assert op[1]['ctm'][4] == pytest.approx(10 + w('a')) and op[1]['ctm'][5] == 80
+    # An absolute x starts a new chunk, dx and dy shift in user units or em, and a line break between tspans is no space
+    op = _built('<text font-size="10" text-anchor="end">\n<tspan x="50" y="10">a</tspan>\n'
+                '<tspan x="90" dy="1em" dx="2">bc</tspan></text>').ops
+    assert [o['text'] for o in op] == ['a', 'bc']
+    assert op[0]['ctm'][4] == pytest.approx(50 - w('a')) and op[0]['ctm'][5] == pytest.approx(90)
+    assert op[1]['ctm'][4] == pytest.approx(92 - w('bc')) and op[1]['ctm'][5] == pytest.approx(80)
+    # A space between words on one line stays; the ends of the text do not count
+    assert [o['text'] for o in _built('<text x="0" y="9">  a <tspan>b</tspan> </text>').ops] == ['a ', 'b']
+    # Anything else within a text is drawn by its own rules
+    mixed = _built('<text x="0" y="9">a<circle r="3" fill="#000000" /></text>').ops
+    assert {o['kind'] for o in mixed} == {'path', 'text'}
+    assert not _built('<text x="0" y="9"> </text>').ops
+
+
+def test_svg_output_keeps_the_miter_limit_of_png_and_pdf():
+    c = pdfwrite.Canvas(None, pagesize = (50, 50))
+    c.setLineJoin(0)
+    p = c.beginPath()
+    p.moveTo(5, 5)
+    p.lineTo(40, 10)
+    p.lineTo(5, 15)
+    c.drawPath(p, fill = 0, stroke = 1)
+    assert 'stroke-miterlimit="10"' in c.to_svg().split('\n')[1]
+    c.state['join'] = 1
+    c.ops[0]['join'] = 1
+    assert 'miterlimit' not in c.to_svg()
+
+
+def test_svg_output_is_the_same_bytes_each_time():
+    def doc(color):
+        c = pdfwrite.Canvas(None, pagesize = (50, 50))
+        c.setFillGradient('linear', (0, 0, 50, 0), [(0, color), (1, (0, 0, 1, 1))])
+        c.rect(0, 0, 50, 50, fill = 1, stroke = 0)
+        return c.to_svg()
+    one, two = doc((1, 0, 0, 1)), doc((0, 1, 0, 1))
+    assert one == doc((1, 0, 0, 1)) and '\0' not in one
+    # Pasted into one figure, different documents still keep their ids apart
+    assert re.search(r'id="(\w+)"', one).group(1) != re.search(r'id="(\w+)"', two).group(1)
+
+
+def _pdf(c):
+    c.target = BytesIO()
+    c.save()
+    return c.target.getvalue()
+
+
+def test_a_gradients_alpha_goes_into_its_mask():
+    c = pdfwrite.Canvas(None, pagesize = (50, 50))
+    c.setFillGradient('radial', (25, 25, 20), [(0, (1, 1, 1, 1)), (1, (0, 0, 0, 0.5))])
+    c.setFillColorRGB(0, 0, 0, alpha = 0.6)
+    c.circle(25, 25, 20, fill = 1, stroke = 0)
+    data = _pdf(c)
+    assert b'/C0 [0.6] /C1 [0.3]' in data and b'/ca 1 /CA 1' in data and b'/ca 0.6' not in data
+
+
+def test_transparent_pages_blend_in_their_own_color_space():
+    group = b'/Group << /Type /Group /S /Transparency /CS /DeviceRGB >>'
+    plain = pdfwrite.Canvas(None, pagesize = (20, 20))
+    plain.rect(0, 0, 9, 9, fill = 1, stroke = 0)
+    assert group not in _pdf(plain)
+    see_through = pdfwrite.Canvas(None, pagesize = (20, 20))
+    see_through.setFillColorRGB(0, 0, 0, alpha = 0.5)
+    see_through.rect(0, 0, 9, 9, fill = 1, stroke = 0)
+    assert group in _pdf(see_through)
+    assert group in _pdf(_canvas(shadow = True))
+    graded = pdfwrite.Canvas(None, pagesize = (20, 20))
+    graded.setFillGradient('linear', (0, 0, 9, 0), [(0, (1, 0, 0, 1)), (1, (0, 0, 1, 1))])
+    graded.rect(0, 0, 9, 9, fill = 1, stroke = 0)
+    assert group in _pdf(graded)
+    for alpha, expected in ((255, False), (128, True)):
+        c = pdfwrite.Canvas(None, pagesize = (20, 20))
+        c.ops.append(dict(c.state, kind = 'image', w = 1, h = 1, rgb = b'\xff\0\0', alpha = bytes([alpha])))
+        assert (group in _pdf(c)) == expected
+
+
+def test_a_sticker_cuts_around_shapes_and_text_only():
+    c = _canvas(sticker = True)
+    c.ops.append(dict(c.ops[0], kind = 'image', w = 1, h = 1, rgb = b'\xff\0\0', alpha = None))
+    assert _pdf(c).startswith(b'%PDF')
+    assert _pixels(c, 1.0)[..., 3].any()
+    c.ops.append(dict(c.ops[0], kind = 'markers', xs = [1.0], ys = [1.0]))
+    assert _pdf(c).startswith(b'%PDF')
+
+
+def test_fonts_are_found_in_every_font_directory_by_any_case(tmp_path):
+    folder = tmp_path / 'deep' / 'er'
+    folder.mkdir(parents = True)
+    source = next(p for p in pdfwrite.pdfmetrics.fonts.values()).ttf.path
+    shutil.copy(source, folder / 'SomeFont.TTF')
+    pdfwrite._installed_fonts.cache_clear()
+    try:
+        with patch.object(pdfwrite, '_FONT_DIRS', [str(tmp_path / 'none'), str(tmp_path)]):
+            assert pdfwrite.TTFont('Some', 'somefont.ttf').ttf.path == str(folder / 'SomeFont.TTF')
+            with patch('os.walk', side_effect = AssertionError('walked twice')):
+                with pytest.raises(FileNotFoundError):
+                    pdfwrite.TTFont('Other', 'other.ttf')
+    finally:
+        pdfwrite._installed_fonts.cache_clear()
+    assert 'Windows' in pdfwrite._FONT_DIRS[1] and any(d.endswith('.local/share/fonts') for d in pdfwrite._FONT_DIRS)
+
+
+def test_a_glyph_set_is_subset_once():
+    def page(text):
+        c = pdfwrite.Canvas(None, pagesize = (50, 50))
+        c.setFont(font_to_use, 10)
+        c.drawString(5, 5, text)
+        return _pdf(c)
+    pdfwrite._font_streams.cache_clear()
+    with patch.object(pdfwrite, 'subset', wraps = pdfwrite.subset) as cut:
+        first = page('abc')
+        assert page('abc') == first and cut.call_count == 1
+        assert page('abd') != first and cut.call_count == 2
+
+
+@pytest.mark.parametrize('cap, closed, expected', [(0, False, 0), (1, False, math.pi * 25), (2, False, 100),
+                                                   (1, True, math.pi * 25), (2, True, 100), (0, True, 0)])
+def test_a_subpath_of_one_point_gets_its_cap(cap, closed, expected):
+    c = pdfwrite.Canvas(None, pagesize = (40, 40))
+    c.setLineCap(cap)
+    c.setLineWidth(10)
+    p = c.beginPath()
+    p.moveTo(20, 20)
+    p.close() if closed else p.lineTo(20, 20)
+    c.drawPath(p, fill = 0, stroke = 1)
+    area = raster.render(c.ops, 40, 40)[..., 3].sum() / 255.0
+    assert area == pytest.approx(expected, abs = 2.5)
+
+
+@pytest.mark.parametrize('dash', [None, [6, 3]])
+def test_a_stroke_scales_with_its_shape(dash):
+    c = pdfwrite.Canvas(None, pagesize = (120, 120))
+    c.scale(4, 1)
+    c.setLineWidth(5)
+    if dash: c.setDash(dash)
+    p = c.beginPath()
+    p.moveTo(15, 10)
+    p.lineTo(15, 110)
+    p.moveTo(5, 60)
+    p.lineTo(25, 60)
+    c.drawPath(p, fill = 0, stroke = 1)
+    ink = raster.render(c.ops, 120, 120)[..., 3] > 127
+    # 5 units across stretch to 20 pixels along x, and stay 5 along y; a dash may end before its full height
+    assert ink[:40].sum(axis = 1).max() <= 21 and (dash or ink[:40].sum(axis = 1).max() >= 19)
+    assert 4 <= ink[:, :40].sum(axis = 0).max() <= 6
+
+
+def test_a_uniform_stroke_is_not_taken_for_a_stretched_one():
+    c = pdfwrite.Canvas(None, pagesize = (60, 60))
+    c.translate(30, 30)
+    c.rotate(30)
+    c.setLineWidth(4)
+    p = c.beginPath()
+    p.moveTo(-20, 0)
+    p.lineTo(20, 0)
+    c.drawPath(p, fill = 0, stroke = 1)
+    subs = raster.flatten(c.ops[0]['path'], c.ops[0]['ctm'])
+    assert raster._stroke(subs, c.ops[0], c.ops[0]['ctm'], 4)[1] is True
+
+
+def _clipped_page(*clips):
+    c = pdfwrite.Canvas(None, pagesize = (100, 100))
+    c.setFillColorRGB(1, 0, 0)
+    c.rect(0, 0, 100, 100, fill = 1, stroke = 0)
+    c.saveState()
+    c.setFillColorRGB(0, 0, 1)
+    c.state['clip'] = list(clips)
+    c.rect(0, 0, 100, 100, fill = 1, stroke = 0)
+    c.restoreState()
+    return raster.render(c.ops, 100, 100, background = (1, 1, 1))
+
+
+def test_a_rotated_clip_cuts_along_its_own_sides():
+    turn = math.radians(45)
+    diamond = ((-20, -20, 40, 40), (math.cos(turn), math.sin(turn), -math.sin(turn), math.cos(turn), 50, 50))
+    px = _clipped_page(diamond)
+    assert tuple(px[50, 50]) == (0, 0, 255)
+    # Inside the bounding box of the diamond but outside the diamond: what lay below stays
+    assert tuple(px[50 - 26, 50 - 26]) == (255, 0, 0) and tuple(px[99, 99]) == (255, 0, 0)
+    # Two of them: only their overlap
+    other = ((-20, -20, 40, 40), (math.cos(turn), math.sin(turn), -math.sin(turn), math.cos(turn), 70, 50))
+    px = _clipped_page(diamond, other)
+    assert tuple(px[50, 60]) == (0, 0, 255) and tuple(px[50, 40]) == (255, 0, 0) and tuple(px[50, 80]) == (255, 0, 0)
+
+
+def test_an_axis_aligned_clip_needs_no_mask():
+    flip = (1.0, 0.0, 0.0, -1.0, 0.0, 100.0)
+    assert raster._clip_mask(None, flip, 100, 100) is None
+    assert raster._clip_mask([((0, 0, 9, 9), (1, 0, 0, 1, 0, 0))], flip, 100, 100) is None
+    assert raster._clip_mask([((0, 0, 9, 9), (0, 1, -1, 0, 50, 0))], flip, 100, 100) is None
+
+
+def test_the_version_is_read_when_asked_for():
+    with patch('importlib.metadata.version', return_value = '9.9.9'):
+        assert glycorender.__version__ == '9.9.9'
+    with patch('importlib.metadata.version', side_effect = importlib.metadata.PackageNotFoundError):
+        assert glycorender.__version__ == '0.0.0+local'
+    with pytest.raises(AttributeError):
+        glycorender.no_such_name

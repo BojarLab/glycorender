@@ -72,16 +72,16 @@ Parameters shared by both:
 Returns an SVG that looks exactly like the PDF, with text as outlines.
 
 ### `simple_svg_to_pdf(svg_data, pdf_path)` / `simple_svg_to_png(svg_data, png_path)`
-Render a general matplotlib-style SVG (e.g., a figure with embedded glycans) without glycan-specific handling.
+Render a general matplotlib-style SVG (e.g., a figure with embedded glycans) without glycan-specific handling, honoring matplotlib's stylesheet, runs of `<tspan>`, clip paths, and embedded PNGs.
 
 ## Supported SVG Elements
 
-- `<path>`: Full support for path commands (M, L, H, V, Z, etc.)
-- `<circle>`: Support for basic circles and gradient-filled circles
+- `<path>`: Support for path commands (M, L, H, V, C, Q, Z, etc.); with `chem=True`, RDKit's bonds keep the caps and joins it states
+- `<circle>` and `<ellipse>`: Support for plain and gradient-filled shapes
 - `<rect>`: Support for rectangles with stroke and fill
 - `<text>` and `<textPath>`: Support for text placement along paths with proper orientation
 - `<defs>`: Support for path and gradient definitions
-- `<radialGradient>`: Support for radial gradients with stops
+- `<radialGradient>` and `<linearGradient>`: Support for gradients with stops
 
 ## Dependencies
 

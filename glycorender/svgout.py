@@ -1,11 +1,12 @@
 """Emit SVG from a pdfwrite display list. Text becomes glyph outlines, so the result carries no font dependency."""
-import itertools
 import re
+import zlib
 from collections import Counter
 from .pdfwrite import _fmt, _inv, _mul
 
-_DOC = itertools.count()  # gradient ids must stay unique when several documents are pasted into one figure
-
+# Stands for what the ids of a document start with until its text is known: they must differ between documents pasted
+# into one figure, and a checksum of the text does that and gives one drawing the same bytes each time
+_PREFIX = '\0'
 _CAP = {0: 'butt', 1: 'round', 2: 'square'}
 _JOIN = {0: 'miter', 1: 'round', 2: 'bevel'}
 
@@ -98,7 +99,7 @@ def _filter(shadow, name):
 
 def emit(ops, width, height, shadow = None, sticker = None):
     body, grads, shapes = [], {}, []
-    prefix = 'grad%d_' % next(_DOC)
+    prefix = _PREFIX
     for op in ops:
         if op['kind'] == 'path':
             if not (op['fill'] or op['stroke']): continue
@@ -178,8 +179,11 @@ def emit(ops, width, height, shadow = None, sticker = None):
         defs += _filter(shadow, prefix + 'shadow')
     if defs:
         defs = '<defs>%s</defs>\n' % defs
-    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<svg xmlns="http://www.w3.org/2000/svg" width="%s" height="%s" viewBox="0 0 %s %s">\n'
-            '%s<g transform="matrix(%s)">\n%s\n</g>\n</svg>\n'
-            % (_fmt(width), _fmt(height), _fmt(width), _fmt(height), defs,
-               ' '.join(_fmt(v) for v in _mul(common, (1.0, 0.0, 0.0, -1.0, 0.0, height))), '\n'.join(body)))
+    # A sharp miter stays one in a browser as in the PNG and the PDF, whose limit is 10 where SVG's default is 4
+    miter = any(op['kind'] == 'path' and op['stroke'] and not op['join'] and len(op['path']) > 2 for op, _ in shapes)
+    doc = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+           '<svg xmlns="http://www.w3.org/2000/svg" width="%s" height="%s" viewBox="0 0 %s %s"%s>\n'
+           '%s<g transform="matrix(%s)">\n%s\n</g>\n</svg>\n'
+           % (_fmt(width), _fmt(height), _fmt(width), _fmt(height), ' stroke-miterlimit="10"' if miter else '', defs,
+              ' '.join(_fmt(v) for v in _mul(common, (1.0, 0.0, 0.0, -1.0, 0.0, height))), '\n'.join(body)))
+    return doc.replace(_PREFIX, 'grad%08x_' % zlib.crc32(doc.encode()))
