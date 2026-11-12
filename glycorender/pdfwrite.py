@@ -1,5 +1,5 @@
 """Minimal PDF canvas: the subset of the reportlab API that render.py actually uses, stdlib only."""
-import os, zlib, math, struct
+import os, zlib, math, struct, time, hashlib
 from functools import lru_cache
 from io import BytesIO
 import numpy as np
@@ -240,6 +240,15 @@ class Canvas:
         self._size = 0
         self.shadow = None
         self.sticker = None
+        # For print: `cmyk` turns an (N, 3) array of RGB in [0, 1] into an (N, 4) array of CMYK, which every color of
+        # the PDF then goes through, and `pdfx`, a dict of the output intent's ICC `profile` bytes, its registered
+        # `condition` and `info`, and optionally `title` and `date` (seconds since the epoch), makes the PDF a PDF/X-4
+        self.cmyk = None
+        self.pdfx = None
+        # Files that travel inside the PDF, each a dict of its `name`, its `data` bytes, optionally those bytes already
+        # deflated by zlib as `packed`, its `mime` type, a `description`, and its `relationship` to the page (PDF 2.0's
+        # AFRelationship: Source, Data, Alternative, Supplement, or Unspecified); readers list them as attachments
+        self.attachments = []
 
     # --- state ---
     def saveState(self):
@@ -421,6 +430,12 @@ class Canvas:
                 xs.append(seg[i])
                 ys.append(seg[i + 1])
         return (min(xs), min(ys), max(xs), max(ys))
+    def _paint(self, rgb, operator):
+        """A color operator: RGB as `rg` or `RG`, or through `cmyk` as `k` or `K`."""
+        if self.cmyk is None:
+            return '%s %s %s %s' % (*(_fmt(v) for v in rgb), operator)
+        return '%s %s %s %s %s' % (*(_fmt(round(float(v), 4)) for v in self.cmyk(np.array([rgb], float))[0]),
+                                   'k' if operator == 'rg' else 'K')
     def _content(self, alphas, shadings, images, forms):
         buf = []
         for op in self.ops:
@@ -441,7 +456,8 @@ class Canvas:
                     paint = ('B' + eo) if (op['fill'] and op['stroke']) else ('f' + eo) if op['fill'] else 'S'
                     name = forms.setdefault((tuple(op['path']), paint, op['line_width'] if op['stroke'] else 0.0),
                                             'M%d' % len(forms))
-                    path = ['q 1 0 0 1 %s %s cm /%s Do Q' % (_fmt(x), _fmt(y), name) for x, y in zip(op['xs'], op['ys'])]
+                    path = ['q 1 0 0 1 %s %s cm /%s Do Q' % (_fmt(x), _fmt(y), name)
+                            for x, y in zip(op['xs'], op['ys'])]
                 if op['fill'] and grad:  # paint the shading through the shape used as a clip
                     idx = _grad_index(shadings, grad, self._path_bbox(op['path'], grad), op['fill_alpha'])
                     buf.append('q')
@@ -454,10 +470,10 @@ class Canvas:
                     continue
                 if solid:
                     buf.append('/%s gs' % _alpha_name(alphas, op['fill_alpha'], False))
-                    buf.append('%s %s %s rg' % tuple(_fmt(v) for v in op['fill_rgb']))
+                    buf.append(self._paint(op['fill_rgb'], 'rg'))
                 if op['stroke']:
                     buf.append('/%s gs' % _alpha_name(alphas, op['stroke_alpha'], True))
-                    buf.append('%s %s %s RG' % tuple(_fmt(v) for v in op['stroke_rgb']))
+                    buf.append(self._paint(op['stroke_rgb'], 'RG'))
                     buf.append('%s w %d J %d j' % (_fmt(op['line_width']), op['cap'], op['join']))
                     if op['dash']:
                         buf.append('[%s] %s d' % (' '.join(_fmt(v) for v in op['dash'][0]), _fmt(op['dash'][1])))
@@ -469,7 +485,7 @@ class Canvas:
                 images.append(op)
             else:
                 buf.append('/%s gs' % _alpha_name(alphas, op['fill_alpha'], False))
-                buf.append('%s %s %s rg' % tuple(_fmt(v) for v in op['fill_rgb']))
+                buf.append(self._paint(op['fill_rgb'], 'rg'))
                 buf.append('BT /%s %s Tf %s Tc 1 0 0 1 %s %s Tm %s TJ ET'
                            % (op['font'], _fmt(op['size']), _fmt(op['char_space']), _fmt(op['x']), _fmt(op['y']),
                               _kerned_run(op['ttf'], op['text'])))
@@ -493,7 +509,7 @@ class Canvas:
                     cur = ctm
                 buf.append('%s %s %s %s %s %s cm' % tuple(_fmt(v) for v in _mul(op['ctm'], _inv(cur))))
                 buf.append('/%s gs /%s gs' % (_alpha_name(alphas, 1.0, False), _alpha_name(alphas, 1.0, True)))
-                buf.append('%s %s %s rg %s %s %s RG' % (tuple(_fmt(v) for v in color) * 2))
+                buf.append('%s %s' % (self._paint(color, 'rg'), self._paint(color, 'RG')))
                 is_path = op['kind'] == 'path'
                 buf.append('%s w 1 J 1 j' % _fmt((op['line_width'] if is_path and op['stroke'] else 0.0) + 2 * grow))
                 if is_path:
@@ -516,10 +532,12 @@ class Canvas:
                          '/Length %d >>\nstream\n' % (w, h, w, len(packed))).encode() + packed + b'\nendstream')
         # The color is one flat value, so the image under the mask is a one-entry palette at a bit per pixel
         body = zlib.compress(bytes((w + 7) // 8 * h), 9)
-        color = ''.join('%02X' % int(round(v * 255)) for v in spec['color'])
-        return out.add(('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace [/Indexed /DeviceRGB 0 '
+        rgb = spec['color'] if self.cmyk is None else self.cmyk(np.array([spec['color']], float))[0]
+        color = ''.join('%02X' % int(round(v * 255)) for v in rgb)
+        return out.add(('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace [/Indexed /Device%s 0 '
                         '<%s>] /BitsPerComponent 1 /Filter /FlateDecode /SMask %d 0 R /Length %d >>\nstream\n'
-                        % (w, h, color, smask, len(body))).encode() + body + b'\nendstream')
+                        % (w, h, 'RGB' if self.cmyk is None else 'CMYK', color, smask, len(body))).encode() + body
+                       + b'\nendstream')
     def _shading_objects(self, out, grad, bbox, alpha):
         """Radial shading plus the luminosity soft mask that carries its per-stop alpha."""
         kind, geo, stops = grad
@@ -528,8 +546,19 @@ class Canvas:
             stype, coords = 3, '[%s %s 0 %s %s %s]' % (_fmt(cx), _fmt(cy), _fmt(cx), _fmt(cy), _fmt(r))
         else:
             stype, coords = 2, '[%s %s %s %s]' % tuple(_fmt(v) for v in geo)
-        sh = out.add(('<< /ShadingType %d /ColorSpace /DeviceRGB /Coords %s /Function %d 0 R /Extend [true true] >>'
-                      % (stype, coords, _stop_function(out, stops, (0, 1, 2)))).encode())
+        if self.cmyk is None:
+            colors, space, channels = stops, 'RGB', (0, 1, 2)
+        else:
+            # Each stretch between stops in four steps, so that a gradient through CMYK keeps to the one through RGB
+            # that it stands for
+            fine = [(o0 + (o1 - o0) * t / 4, tuple(a + (b - a) * t / 4 for a, b in zip(c0[:3], c1[:3])))
+                    for (o0, c0), (o1, c1) in zip(stops[:-1], stops[1:]) for t in range(4)] + [(stops[-1][0],
+                                                                                                stops[-1][1][:3])]
+            cmyk = self.cmyk(np.array([c for _, c in fine], float))
+            colors, space, channels = [(o, tuple(float(v) for v in c)) for (o, _), c in zip(fine, cmyk)], 'CMYK', (
+                0, 1, 2, 3)
+        sh = out.add(('<< /ShadingType %d /ColorSpace /Device%s /Coords %s /Function %d 0 R /Extend [true true] >>'
+                      % (stype, space, coords, _stop_function(out, colors, channels))).encode())
         # The op's alpha goes into the mask, not next to it as /ca, which MuPDF applies inside the mask as well as out
         alpha_sh = out.add(
             ('<< /ShadingType %d /ColorSpace /DeviceGray /Coords %s /Function %d 0 R /Extend [true true] >>'
@@ -562,7 +591,8 @@ class Canvas:
         cid = out.add(('<< /Type /Font /Subtype /CIDFontType2 /BaseFont /%s /CIDSystemInfo '
                        '<< /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor %d 0 R '
                        '/DW 1000 /W %s /CIDToGIDMap /Identity >>' % (base, desc, widths)).encode())
-        tou = out.add(b'<< /Length %d /Filter /FlateDecode >>\nstream\n' % len(packed_cmap) + packed_cmap + b'\nendstream')
+        tou = out.add(b'<< /Length %d /Filter /FlateDecode >>\nstream\n' % len(packed_cmap) + packed_cmap
+                      + b'\nendstream')
         return out.add(('<< /Type /Font /Subtype /Type0 /BaseFont /%s /Encoding /Identity-H '
                         '/DescendantFonts [%d 0 R] /ToUnicode %d 0 R >>' % (base, cid, tou)).encode())
     def save(self):
@@ -580,14 +610,24 @@ class Canvas:
             if op['alpha'] is not None and op['alpha'].count(255) < len(op['alpha']):
                 packed = deflate_rows(op['alpha'], op['h'])
                 smask = '/SMask %d 0 R ' % out.add(
-                    ('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 8 '
-                     '/Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns %d >> /Length %d >>\nstream\n'
+                    ('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray '
+                     '/BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns %d >> '
+                     '/Length %d >>\nstream\n'
                      % (op['w'], op['h'], op['w'], len(packed))).encode() + packed + b'\nendstream')
-            packed = deflate_rows(op['rgb'], op['h'])
+            px, space = op['rgb'], 'RGB'
+            if self.cmyk is not None:
+                # Each color once, as a layer of marks or a heatmap holds few beside its many pixels
+                rgb = np.frombuffer(px, np.uint8).reshape(-1, 3)
+                found, back = np.unique(rgb[:, 0].astype(np.int32) << 16 | rgb[:, 1].astype(np.int32) << 8 | rgb[:, 2],
+                                        return_inverse = True)
+                cmyk = self.cmyk(np.stack([found >> 16, found >> 8 & 255, found & 255], 1) / 255.0)
+                px, space = (np.clip(cmyk, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)[back.ravel()].tobytes(), 'CMYK'
+            packed = deflate_rows(px, op['h'])
             xobj += '/Im%d %d 0 R ' % (i, out.add(
-                ('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB /BitsPerComponent 8 '
-                 '%s/Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors 3 /Columns %d >> /Length %d >>\nstream\n'
-                 % (op['w'], op['h'], smask, op['w'], len(packed))).encode() + packed + b'\nendstream'))
+                ('<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /Device%s /BitsPerComponent 8 %s'
+                 '/Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors %d /Columns %d >> /Length %d >>\nstream\n'
+                 % (op['w'], op['h'], space, smask, len(space), op['w'], len(packed))).encode() + packed
+                + b'\nendstream'))
         for (path, paint, width), name in forms.items():
             # Past the path's own points by as far as a miter at the default limit can reach
             xs = [seg[i] for seg in path for i in range(1, len(seg), 2)]
@@ -621,24 +661,91 @@ class Canvas:
         # one, such as Acrobat's working CMYK, and shift its colors
         clear = (shadow or shadings or any(k[0] < 1 for k in alphas) or
                  any(op['alpha'] is not None and op['alpha'].count(255) < len(op['alpha']) for op in images))
-        group = ' /Group << /Type /Group /S /Transparency /CS /DeviceRGB >>' if clear else ''
-        page = out.add(('<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %s %s] /Resources %s /Contents %d 0 R%s >>'
-                        % (pages_ref, _fmt(self.width), _fmt(self.height), res, stream, group)).encode())
+        group = (' /Group << /Type /Group /S /Transparency /CS /Device%s >>' % ('RGB' if self.cmyk is None else 'CMYK')
+                 if clear else '')
+        # PDF/X has the trimmed page say where it ends
+        trim = ' /TrimBox [0 0 %s %s]' % (_fmt(self.width), _fmt(self.height)) if self.pdfx else ''
+        page = out.add(('<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %s %s]%s /Resources %s /Contents %d 0 R%s >>'
+                        % (pages_ref, _fmt(self.width), _fmt(self.height), trim, res, stream, group)).encode())
         out.set(pages_ref, ('<< /Type /Pages /Kids [%d 0 R] /Count 1 >>' % page).encode())
-        root = out.add(('<< /Type /Catalog /Pages %d 0 R >>' % pages_ref).encode())
+        if self.pdfx:
+            # PDF/X is a print exchange of the page alone
+            if self.attachments:
+                raise ValueError('A PDF/X carries no attachments; leave out either pdfx or attachments')
+            return self._save_pdfx(out, pages_ref, content)
+        # Non-ASCII text strings go out as UTF-16BE with a BOM, so α, β, and → survive instead of becoming '?'
+        string = lambda v: (b'(%s)' % _esc(v.encode('ascii')) if v.isascii() else
+                            b'<FEFF%s>' % v.encode('utf-16-be').hex().upper().encode())
+        files = []
+        for spec in self.attachments:
+            packed = spec.get('packed') or zlib.compress(spec['data'], 6)
+            mime = ''.join(ch if ch.isalnum() or ch in '.+-_' else '#%02X' % ord(ch) for ch in spec.get(
+                'mime', 'application/octet-stream'))
+            embedded = out.add(b'<< /Type /EmbeddedFile /Subtype /%s /Params << /Size %d >> /Filter /FlateDecode '
+                               b'/Length %d >>\nstream\n' % (mime.encode(), len(spec['data']), len(packed)) + packed
+                               + b'\nendstream')
+            name = string(spec['name'])
+            files.append((spec['name'], out.add(
+                b'<< /Type /Filespec /F %s /UF %s /Desc %s /AFRelationship /%s /EF << /F %d 0 R /UF %d 0 R >> >>' % (
+                    name, name, string(spec.get('description', '')), spec.get('relationship', 'Unspecified').encode(),
+                    embedded, embedded))))
+        # A name tree's keys come sorted
+        files.sort()
+        attached = (b' /Names << /EmbeddedFiles << /Names [%s] >> >> /AF [%s]' % (
+            b' '.join(b'%s %d 0 R' % (string(n), ref) for n, ref in files),
+            b' '.join(b'%d 0 R' % ref for _, ref in files)) if files else b'')
+        root = out.add(b'<< /Type /Catalog /Pages %d 0 R%s >>' % (pages_ref, attached))
         info = None
         if self.info:
-            # Non-ASCII text strings go out as UTF-16BE with a BOM, so α, β, and → survive instead of becoming '?'
-            info = out.add(b'<< ' + b' '.join(
-                b'/%s (%s)' % (k.encode(), _esc(v.encode('ascii'))) if v.isascii()
-                else b'/%s <FEFF%s>' % (k.encode(), v.encode('utf-16-be').hex().upper().encode())
-                for k, v in self.info.items()) + b' >>')
-        data = out.render(root, info)
+            info = out.add(b'<< ' + b' '.join(b'/%s %s' % (k.encode(), string(v)) for k, v in self.info.items())
+                           + b' >>')
+        self._write(out.render(root, info))
+    def _write(self, data):
         if hasattr(self.target, 'write'):
             self.target.write(data)
         else:
             with open(str(self.target), 'wb') as fh:
                 fh.write(data)
+    def _save_pdfx(self, out, pages_ref, content):
+        """The catalog, metadata, and trailer of a PDF/X-4 (ISO 15930-7): an output intent naming the registered
+        print condition with its ICC profile, a title and dates kept alike in the Info dictionary and the XMP
+        metadata, the trapping left to the printer, and a document ID."""
+        spec = self.pdfx
+        stamp = time.gmtime(spec.get('date') or int(os.environ.get('SOURCE_DATE_EPOCH', time.time())))
+        title = spec.get('title') or self.info.get('Title') or 'Figure'
+        packed = zlib.compress(spec['profile'], 9)
+        icc = out.add(b'<< /N 4 /Filter /FlateDecode /Length %d >>\nstream\n' % len(packed) + packed + b'\nendstream')
+        text = lambda v: '(%s)' % _esc(v.encode('latin-1', 'replace')).decode('latin-1')
+        intent = out.add(('<< /Type /OutputIntent /S /GTS_PDFX /OutputConditionIdentifier %s /RegistryName %s /Info %s '
+                          '/DestOutputProfile %d 0 R >>' % (text(spec['condition']), text(spec.get(
+                              'registry', 'http://www.color.org')), text(spec.get('info', spec['condition'])),
+                                                          icc)).encode())
+        ident = hashlib.md5(content + time.strftime('%Y%m%d%H%M%S', stamp).encode() + title.encode()).hexdigest()
+        when = time.strftime('%Y-%m-%dT%H:%M:%SZ', stamp)
+        escape = lambda v: v.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        xmp = ('<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+               '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+               '<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" '
+               'xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:pdf="http://ns.adobe.com/pdf/1.3/" '
+               'xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/" xmlns:pdfxid="http://www.npes.org/pdfx/ns/id/">'
+               '<dc:format>application/pdf</dc:format><dc:title><rdf:Alt><rdf:li xml:lang="x-default">%s</rdf:li>'
+               '</rdf:Alt></dc:title><xmp:CreateDate>%s</xmp:CreateDate><xmp:ModifyDate>%s</xmp:ModifyDate>'
+               '<xmp:MetadataDate>%s</xmp:MetadataDate><xmp:CreatorTool>%s</xmp:CreatorTool>'
+               '<pdf:Producer>glycorender</pdf:Producer><pdf:Trapped>False</pdf:Trapped>'
+               '<xmpMM:DocumentID>uuid:%s</xmpMM:DocumentID><xmpMM:InstanceID>uuid:%s</xmpMM:InstanceID>'
+               '<xmpMM:RenditionClass>default</xmpMM:RenditionClass><xmpMM:VersionID>1</xmpMM:VersionID>'
+               '<pdfxid:GTS_PDFXVersion>PDF/X-4</pdfxid:GTS_PDFXVersion></rdf:Description></rdf:RDF></x:xmpmeta>\n'
+               '<?xpacket end="w"?>' % (escape(title), when, when, when, escape(spec.get('creator', 'glycorender')),
+                                        '%s-%s-%s-%s-%s' % (ident[:8], ident[8:12], ident[12:16], ident[16:20],
+                                                            ident[20:]), ident)).encode('utf-8')
+        meta = out.add(b'<< /Type /Metadata /Subtype /XML /Length %d >>\nstream\n' % len(xmp) + xmp + b'\nendstream')
+        root = out.add(('<< /Type /Catalog /Pages %d 0 R /OutputIntents [%d 0 R] /Metadata %d 0 R >>'
+                        % (pages_ref, intent, meta)).encode())
+        date = time.strftime("D:%Y%m%d%H%M%SZ", stamp)
+        info = out.add(('<< /Title %s /Creator %s /Producer (glycorender) /CreationDate (%s) /ModDate (%s) '
+                        '/Trapped /False /GTS_PDFXVersion (PDF/X-4) >>' % (text(title), text(spec.get(
+                            'creator', 'glycorender')), date, date)).encode())
+        self._write(out.render(root, info, '1.6', ident))
 
 
 class _Writer:
@@ -653,9 +760,9 @@ class _Writer:
     def add(self, body):
         self.objs.append(body)
         return len(self.objs)
-    def render(self, root, info):
+    def render(self, root, info, version = '1.4', ident = None):
         out = BytesIO()
-        out.write(b'%PDF-1.4\n%\xe2\xe3\xcf\xd3\n')
+        out.write(b'%%PDF-%s\n%%\xe2\xe3\xcf\xd3\n' % version.encode())
         offsets = []
         for i, body in enumerate(self.objs, 1):
             offsets.append(out.tell())
@@ -667,5 +774,7 @@ class _Writer:
         trailer = b'trailer\n<< /Size %d /Root %d 0 R' % (len(self.objs) + 1, root)
         if info:
             trailer += b' /Info %d 0 R' % info
+        if ident:
+            trailer += b' /ID [<%s> <%s>]' % (ident.encode(), ident.encode())
         out.write(trailer + b' >>\nstartxref\n%d\n%%%%EOF\n' % xref)
         return out.getvalue()

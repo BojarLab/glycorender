@@ -726,10 +726,16 @@ def _box_blur(a, radius, f = 1):
             # windows that reach past either end simply stop there, as with zeros beyond
             b = b.T if axis else b
             n, r, c = len(b), k // 2, np.cumsum(b, axis = 0)
-            b = np.empty_like(c)
-            b[r + 1:n - r] = c[k:] - c[:n - k]
-            b[:r + 1] = c[r:k]
-            b[n - r:] = c[-1] - c[n - k:n - r - 1]
+            if k >= n:
+                # A window as wide as the array or wider sums whatever of it lies within, from either end
+                c = np.concatenate([np.zeros_like(c[:1]), c])
+                spots = np.arange(n)
+                b = c[np.minimum(spots + r + 1, n)] - c[np.maximum(spots - r, 0)]
+            else:
+                b = np.empty_like(c)
+                b[r + 1:n - r] = c[k:] - c[:n - k]
+                b[:r + 1] = c[r:k]
+                b[n - r:] = c[-1] - c[n - k:n - r - 1]
             b *= 1.0 / k
             b = b.T if axis else b
     out[y0:y1, x0:x1] = b

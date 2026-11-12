@@ -1057,3 +1057,112 @@ def test_the_version_is_read_when_asked_for():
         assert glycorender.__version__ == '0.0.0+local'
     with pytest.raises(AttributeError):
         glycorender.no_such_name
+
+
+def _cmyk_canvas():
+    c = pdfwrite.Canvas(BytesIO(), pagesize = (100, 100))
+    c.cmyk = lambda rgb: np.column_stack([1 - rgb, np.zeros(len(rgb))])
+    return c
+
+
+def test_cmyk_output_paints_every_color_in_cmyk():
+    c = _cmyk_canvas()
+    c.setFillColorRGB(1.0, 0.5, 0.0, alpha = 0.5)
+    c.setStrokeColorRGB(0.0, 0.0, 1.0)
+    c.rect(10, 10, 30, 30, fill = 1, stroke = 1)
+    c.setFillGradient('linear', (0, 0, 100, 0), [(0, (1.0, 0.0, 0.0, 1.0)), (1, (0.0, 0.0, 1.0, 0.5))])
+    c.rect(50, 50, 30, 30, fill = 1, stroke = 0)
+    c.ops.append(dict(c.state, kind = 'image', w = 2, h = 1, rgb = bytes([255, 0, 0, 0, 255, 0]), fill_grad = None,
+                      alpha = bytes([255, 128]), ctm = (20, 0, 0, 20, 60, 10)))
+    c.save()
+    pdf = c.target.getvalue()
+    content = zlib.decompress(re.search(rb'<< /Length \d+ /Filter /FlateDecode >>\nstream\n(.*?)\nendstream', pdf,
+                                        re.S).group(1))
+    assert b'0 0.5 1 0 k' in content and b'1 1 0 0 K' in content and b' rg' not in content
+    assert b'/DeviceRGB' not in pdf and pdf.count(b'/ColorSpace /DeviceCMYK') == 2 and b'/Colors 4' in pdf
+    assert b'/CS /DeviceCMYK' in pdf and pdf.startswith(b'%PDF-1.4')
+
+
+def test_pdf_x_names_its_output_intent_and_keeps_info_and_xmp_alike():
+    c = _cmyk_canvas()
+    c.pdfx = dict(profile = b'icc profile bytes', condition = 'CGATS TR 001', info = 'SWOP', title = 'A (title)',
+                  date = 1700000000)
+    c.setFillColorRGB(0.2, 0.4, 0.6)
+    c.rect(10, 10, 30, 30, fill = 1, stroke = 0)
+    c.save()
+    pdf = c.target.getvalue()
+    assert pdf.startswith(b'%PDF-1.6') and b'/TrimBox [0 0 100 100]' in pdf and b'/ID [<' in pdf
+    assert b'/OutputIntents [' in pdf and b'/S /GTS_PDFX /OutputConditionIdentifier (CGATS TR 001)' in pdf
+    assert b'/DestOutputProfile' in pdf and b'/Metadata' in pdf and b'/Trapped /False' in pdf
+    assert rb'/Title (A \(title\))' in pdf and b'<rdf:li xml:lang="x-default">A (title)</rdf:li>' in pdf
+    assert b'/CreationDate (D:20231114221320Z)' in pdf and b'<xmp:CreateDate>2023-11-14T22:13:20Z' in pdf
+    profile = re.search(rb'<< /N 4 /Filter /FlateDecode /Length \d+ >>\nstream\n(.*?)\nendstream', pdf, re.S).group(1)
+    assert zlib.decompress(profile) == b'icc profile bytes'
+    # The same page and date give the same file
+    again = _cmyk_canvas()
+    again.pdfx, again.ops = dict(c.pdfx), c.ops
+    again.save()
+    assert again.target.getvalue() == pdf
+
+
+def test_attachments_travel_in_the_pdf_and_leave_the_page_alone():
+    def page(attachments):
+        c = pdfwrite.Canvas(BytesIO(), pagesize = (100, 100))
+        c.setTitle('Plot é')
+        c.setFillColorRGB(0.2, 0.4, 0.6)
+        c.rect(10, 10, 30, 30, fill = 1, stroke = 0)
+        c.attachments = attachments
+        c.save()
+        return c.target.getvalue()
+    plain = page([])
+    data = b'{"calls": []}' * 50
+    pdf = page([dict(name = 'zeta.json', data = data, mime = 'application/vnd.viscose+json', description = 'Its source',
+                     relationship = 'Source'), dict(name = 'alpha.csv', data = b'a,b\n1,2\n', packed = zlib.compress(
+                         b'a,b\n1,2\n', 1))])
+    assert b'/Title <FEFF' in plain and b'/EmbeddedFiles' not in plain and b'/AF' not in plain
+    found = re.search(rb'/Subtype /application#2Fvnd\.viscose\+json /Params << /Size (\d+) >> /Filter /FlateDecode '
+                      rb'/Length (\d+) >>\nstream\n', pdf)
+    assert int(found.group(1)) == len(data)
+    assert zlib.decompress(pdf[found.end():found.end() + int(found.group(2))]) == data
+    assert b'/Subtype /application#2Foctet-stream' in pdf and b'/AFRelationship /Source' in pdf
+    # The name tree in order of names, each pointing at its file specification, which the catalog lists as /AF
+    names = re.search(rb'/EmbeddedFiles << /Names \[\(alpha\.csv\) (\d+) 0 R \(zeta\.json\) (\d+) 0 R\] >> >> '
+                      rb'/AF \[(\d+) 0 R (\d+) 0 R\]', pdf)
+    assert names and names.group(1, 2) == names.group(3, 4) and b'/Desc (Its source)' in pdf
+    # The page itself is written as without them
+    content = lambda b: re.search(rb'<< /Length \d+ /Filter /FlateDecode >>\nstream\n.*?endstream', b, re.S).group(0)
+    assert content(pdf) == content(plain)
+    c = _cmyk_canvas()
+    c.pdfx = dict(profile = b'icc', condition = 'CGATS TR 001', info = 'SWOP')
+    c.attachments = [dict(name = 'a', data = b'a')]
+    with pytest.raises(ValueError, match = 'PDF/X carries no attachments'):
+        c.save()
+
+
+def test_cmyk_output_carries_shadows_and_stickers():
+    c = _cmyk_canvas()
+    c.shadow, c.sticker = True, True
+    c.setFillColorRGB(0.2, 0.4, 0.6)
+    c.setStrokeColorRGB(0.0, 0.0, 0.0)
+    c.circle(50, 50, 20, fill = 1, stroke = 1)
+    c.save()
+    pdf = c.target.getvalue()
+    # The test's conversion inks black as full cyan, magenta, and yellow
+    assert b'/Indexed /DeviceCMYK 0 <FFFFFF00>' in pdf and b'/DeviceRGB' not in pdf
+
+
+def test_box_blur_takes_windows_wider_than_the_array():
+    rng = np.random.default_rng(4)
+    small = rng.random((6, 9)).astype(np.float32)
+    for radius in (2, 5, 12):
+        k = 2 * radius + 1
+        lo = max(1, (int(math.sqrt(k * k)) - 1) // 2 * 2 + 1)
+        ks = min(([lo] * (3 - n) + [lo + 2] * n for n in range(4)),
+                 key = lambda q: abs(sum(v * v - 1 for v in q) / 12 - (k * k - 1) / 4.0))
+        # Each pass sums its window with zeros beyond either end, however wide the window
+        b = small.astype(np.float64)
+        for w in ks:
+            for axis in (0, 1):
+                p = np.pad(b, [(w // 2, w // 2) if i == axis else (0, 0) for i in range(2)])
+                b = sum(np.take(p, np.arange(j, j + b.shape[axis]), axis = axis) for j in range(w)) / w
+        assert np.allclose(raster._box_blur(small, radius), b, atol = 1e-5)
